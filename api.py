@@ -30,7 +30,7 @@ app = FastAPI(title="Alpha AI API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "https://alpha-ai-ls00o9szr-mojo13-creators-projects.vercel.app", "https://*.vercel.app"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
