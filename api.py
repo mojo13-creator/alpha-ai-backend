@@ -23,7 +23,7 @@ def safe_float(val, default=0.0):
         return default if math.isnan(v) or math.isinf(v) else v
     except:
         return default
-from data_collection.reddit_scraper import fetch_reddit_sentiment
+from data_collection.reddit_scraper import RedditScraper
 from analysis.hybrid_recommender import HybridRecommender
 
 app = FastAPI(title="Alpha AI API", version="1.0.0")
@@ -590,6 +590,42 @@ async def get_alerts():
                 "medium": len([a for a in alerts if a["severity"] == "MEDIUM"]),
                 "low": len([a for a in alerts if a["severity"] == "LOW"])}
 
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== REPORTS ENDPOINTS ==========
+from reports.report_generator import ReportGenerator
+
+report_generator = ReportGenerator(db, analyzer, recommender, news_scraper)
+
+@app.get("/api/reports/daily")
+async def get_daily_report():
+    try:
+        report = report_generator.generate_daily_report()
+        return {"type": "daily", "report": report, "generated_at": __import__('datetime').datetime.now().isoformat()}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/reports/weekly")
+async def get_weekly_report():
+    try:
+        report = report_generator.generate_weekly_report()
+        return {"type": "weekly", "report": report, "generated_at": __import__('datetime').datetime.now().isoformat()}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/reports/monthly")
+async def get_monthly_report():
+    try:
+        report = report_generator.generate_monthly_report()
+        return {"type": "monthly", "report": report, "generated_at": __import__('datetime').datetime.now().isoformat()}
     except Exception as e:
         import traceback
         traceback.print_exc()
