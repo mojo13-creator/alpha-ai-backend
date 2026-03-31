@@ -63,6 +63,19 @@ async def analyze_stock(request: AnalysisRequest):
         if not latest_price:
             raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
         
+        # Get real-time price + previous close from yfinance
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            fast = ticker.fast_info
+            realtime_price = float(fast.last_price) if fast.last_price else None
+            if not realtime_price:
+                realtime_price = float(fast.regular_market_price) if hasattr(fast, 'regular_market_price') and fast.regular_market_price else None
+            prev_close = float(fast.previous_close) if hasattr(fast, 'previous_close') and fast.previous_close else None
+        except Exception:
+            realtime_price = None
+            prev_close = None
+        
         print(f"📈 Calculating indicators...")
         df = analyzer.calculate_all_indicators(symbol)
         
@@ -70,7 +83,8 @@ async def analyze_stock(request: AnalysisRequest):
             raise HTTPException(status_code=500, detail="Technical analysis failed")
         
         latest = df.iloc[-1]
-        price = float(latest['close'])
+        price = realtime_price if realtime_price else float(latest['close'])
+        print(f"💰 Real-time price for {symbol}: ${price:.2f}")
         
         print(f"🤖 Getting recommendation...")
         result = recommender.analyze_and_recommend(symbol)
@@ -113,7 +127,10 @@ async def analyze_stock(request: AnalysisRequest):
         
         response = {
             "symbol": symbol,
-            "price": float(result.get('price', price)),
+            "price": realtime_price if realtime_price else float(result.get('price', price)),
+            "prev_close": prev_close,
+            "price_change": round(realtime_price - prev_close, 2) if realtime_price and prev_close else 0.0,
+            "price_change_pct": round(((realtime_price - prev_close) / prev_close) * 100, 2) if realtime_price and prev_close else 0.0,
             "recommendation": result.get('recommendation', 'HOLD'),
             "score": int(result.get('score', 50)),
             "reasoning": str(result.get('reasoning', 'Analysis complete')),
