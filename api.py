@@ -630,3 +630,30 @@ async def get_monthly_report():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== FINVIZ SCREENER ==========
+from data_collection.finviz_scraper import FinvizScraper
+finviz = FinvizScraper()
+
+@app.get("/api/finviz/screener")
+async def get_finviz_signals():
+    try:
+        results = finviz.get_all_signals()
+        return {
+            "stocks": results,
+            "count": len(results),
+            "generated_at": __import__("datetime").datetime.now().isoformat()
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/finviz/strong-buys")
+async def get_strong_buys():
+    try:
+        results = finviz.get_strong_buys()
+        return {"stocks": results, "count": len(results)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

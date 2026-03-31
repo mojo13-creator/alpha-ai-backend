@@ -82,3 +82,5 @@ websockets==16.0
 yfinance==1.1.0
 psycopg2-binary
 newsapi-python
+finvizfinance
+lxml
