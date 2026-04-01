@@ -121,6 +121,16 @@ class DatabaseManager:
                     dividend_yield REAL, beta REAL, last_updated TIMESTAMP
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pending_imports (
+                    id SERIAL PRIMARY KEY,
+                    action TEXT, symbol TEXT, company_name TEXT,
+                    price REAL, trade_date DATE, shares REAL,
+                    source TEXT DEFAULT 'gmail',
+                    email_id TEXT UNIQUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS stock_prices (
@@ -195,6 +205,16 @@ class DatabaseManager:
                     symbol TEXT UNIQUE, name TEXT, sector TEXT,
                     industry TEXT, market_cap REAL, pe_ratio REAL,
                     dividend_yield REAL, beta REAL, last_updated DATETIME
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pending_imports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action TEXT, symbol TEXT, company_name TEXT,
+                    price REAL, trade_date DATE, shares REAL,
+                    source TEXT DEFAULT 'gmail',
+                    email_id TEXT UNIQUE,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -477,3 +497,45 @@ class DatabaseManager:
         conn.commit()
         conn.close()
         print(f"🗑️  Cleared {p} prices, {n} news, {r} reddit posts")
+
+    def add_pending_import(self, action, symbol, company_name, price, trade_date, email_id, shares=None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"""
+                INSERT INTO pending_imports (action, symbol, company_name, price, trade_date, shares, email_id)
+                VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH})
+            """, (action, symbol, company_name, price, trade_date, shares, email_id))
+            conn.commit()
+            return True
+        except Exception:
+            return False  # duplicate email_id
+        finally:
+            conn.close()
+
+    def get_pending_imports(self):
+        conn = self.get_connection()
+        df = pd.read_sql_query("SELECT * FROM pending_imports ORDER BY trade_date DESC", conn)
+        conn.close()
+        return df
+
+    def update_pending_shares(self, import_id, shares):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE pending_imports SET shares = {PH} WHERE id = {PH}", (shares, import_id))
+        conn.commit()
+        conn.close()
+
+    def delete_pending_import(self, import_id):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"DELETE FROM pending_imports WHERE id = {PH}", (import_id,))
+        conn.commit()
+        conn.close()
+
+    def clear_pending_imports(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM pending_imports")
+        conn.commit()
+        conn.close()

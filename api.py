@@ -674,3 +674,85 @@ async def get_strong_buys():
         return {"stocks": results, "count": len(results)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== PORTFOLIO IMPORT ENDPOINTS ==========
+from pydantic import BaseModel as BM
+from typing import Optional, List
+
+class PendingImport(BM):
+    action: str
+    symbol: str
+    company_name: str
+    price: float
+    trade_date: str
+    email_id: str
+    shares: Optional[float] = None
+
+class ConfirmImport(BM):
+    import_id: int
+    shares: float
+
+@app.post("/api/portfolio/pending")
+async def add_pending_imports(trades: List[PendingImport]):
+    """Receive parsed trades from Gmail and save as pending"""
+    added = 0
+    for trade in trades:
+        success = db.add_pending_import(
+            action=trade.action,
+            symbol=trade.symbol,
+            company_name=trade.company_name,
+            price=trade.price,
+            trade_date=trade.trade_date,
+            email_id=trade.email_id,
+            shares=trade.shares
+        )
+        if success:
+            added += 1
+    return {"added": added, "total": len(trades)}
+
+@app.get("/api/portfolio/pending")
+async def get_pending_imports():
+    """Get all pending imports waiting for confirmation"""
+    try:
+        df = db.get_pending_imports()
+        if df.empty:
+            return {"pending": [], "count": 0}
+        records = df.to_dict(orient="records")
+        for r in records:
+            for k, v in r.items():
+                if hasattr(v, "item"):
+                    r[k] = v.item()
+        return {"pending": records, "count": len(records)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/portfolio/pending/confirm")
+async def confirm_import(data: ConfirmImport):
+    """Confirm a pending import and add to portfolio"""
+    try:
+        df = db.get_pending_imports()
+        row = df[df["id"] == data.import_id]
+        if row.empty:
+            raise HTTPException(status_code=404, detail="Pending import not found")
+        r = row.iloc[0]
+        if r["action"] == "BOUGHT":
+            db.add_portfolio_position(
+                symbol=r["symbol"],
+                shares=data.shares,
+                purchase_price=float(r["price"]),
+                purchase_date=str(r["trade_date"]),
+                notes=f"Imported from Fidelity email"
+            )
+        db.delete_pending_import(data.import_id)
+        return {"message": f"Successfully imported {r['action']} {r['symbol']}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/portfolio/pending/{import_id}")
+async def dismiss_pending_import(import_id: int):
+    """Dismiss a pending import without adding to portfolio"""
+    db.delete_pending_import(import_id)
+    return {"message": "Dismissed"}
