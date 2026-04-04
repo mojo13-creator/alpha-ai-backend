@@ -1,7 +1,10 @@
 # config.py - Configuration file for Stock Analyzer
-# This file stores all settings and API keys
+# API keys are loaded from .env — never hardcode secrets here
 
 import os
+from dotenv import load_dotenv
+
+load_dotenv()  # Load .env from project root
 
 # ============= API KEYS =============
 # We'll fill these in later when we get API access
@@ -9,7 +12,7 @@ REDDIT_CLIENT_ID = "your_reddit_client_id_here"
 REDDIT_CLIENT_SECRET = "your_reddit_client_secret_here"
 REDDIT_USER_AGENT = "stock-analyzer-mac by u/yourusername"
 
-NEWS_API_KEY = "REDACTED_NEWS_API_KEY"
+NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
 
 # Optional: Alpha Vantage API Key for backup data source
 ALPHA_VANTAGE_KEY = "optional_alphavantage_key"  # Optional backup
@@ -210,7 +213,9 @@ print("✅ Configuration loaded successfully!")
 # ============================================
 
 # Claude API Key (get from https://console.anthropic.com/)
-CLAUDE_API_KEY = "REDACTED_CLAUDE_API_KEY"  # Add your key here after signup
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
+if not CLAUDE_API_KEY:
+    raise ValueError("CLAUDE_API_KEY not set — add it to your .env file")
 
 # Enable/Disable AI Analysis
 # Set to False to use traditional technical analysis

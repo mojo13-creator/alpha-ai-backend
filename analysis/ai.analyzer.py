@@ -1,6 +1,9 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 # === AI CONFIGURATION ===
-CLAUDE_API_KEY = "REDACTED_CLAUDE_API_KEY"  # Replace with your actual key
+# Key is loaded from .env — never hardcode here
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
 # Use AI for stock analysis (set to False to use technical only)
 USE_AI_ANALYSIS = True

@@ -1,0 +1,42 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+.env.local
+.env.production
+.env.staging
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Logs
+*.log
+logs/
+
+# Database (local only)
+stock_data.db
+
+# Reports archive (local only)
+reports_archive/
+exports/
