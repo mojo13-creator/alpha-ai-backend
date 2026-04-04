@@ -84,3 +84,5 @@ psycopg2-binary
 newsapi-python
 finvizfinance
 lxml
+python-dotenv
+slowapi
