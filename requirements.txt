@@ -86,3 +86,5 @@ finvizfinance
 lxml
 python-dotenv
 slowapi
+playwright
+wrds

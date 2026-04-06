@@ -40,3 +40,8 @@ stock_data.db
 # Reports archive (local only)
 reports_archive/
 exports/
+
+# Browser automation state
+browser_state/
+*.cookies
+playwright-state/

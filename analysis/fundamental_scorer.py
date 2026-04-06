@@ -32,9 +32,118 @@ def classify_market_cap(market_cap):
     return 'mega', 'Mega Cap'
 
 
-def calculate_fundamental_score(symbol):
+def calculate_berkeley_adjustment(berkeley_data):
+    """
+    Calculate score adjustment from Berkeley enrichment data.
+    Returns (adjustment_points, signals_list). Max +-15 points.
+    """
+    adj = 0.0
+    signals = []
+
+    if not berkeley_data:
+        return 0, []
+
+    # --- Capital IQ ---
+    capiq = berkeley_data.get("capital_iq", {})
+    if capiq:
+        # Analyst consensus
+        consensus = (capiq.get("analyst", {}).get("consensus") or "").lower()
+        if any(w in consensus for w in ["strong buy", "overweight"]):
+            adj += 5
+            signals.append(f"CapIQ analyst consensus: {consensus}")
+        elif any(w in consensus for w in ["buy"]):
+            adj += 3
+        elif any(w in consensus for w in ["sell", "underweight"]):
+            adj -= 5
+            signals.append(f"CapIQ analyst consensus: {consensus}")
+        elif any(w in consensus for w in ["strong sell"]):
+            adj -= 7
+
+        # Price targets — compare mean to current
+        pt_mean = capiq.get("analyst", {}).get("price_target_mean")
+        if pt_mean and isinstance(pt_mean, (int, float)) and pt_mean > 0:
+            signals.append(f"CapIQ mean price target: ${pt_mean:.2f}")
+
+        # Institutional ownership
+        inst_pct = capiq.get("ownership", {}).get("institutional_pct")
+        if inst_pct and isinstance(inst_pct, (int, float)):
+            if inst_pct > 0.7:
+                adj += 3
+                signals.append(f"High institutional ownership: {inst_pct*100:.0f}%")
+            elif inst_pct < 0.2:
+                adj -= 2
+
+        # Insider transactions — net buying vs selling
+        insider_txns = capiq.get("ownership", {}).get("insider_transactions", [])
+        if insider_txns:
+            buys = sum(1 for t in insider_txns if "buy" in (t.get("type", "") or "").lower())
+            sells = sum(1 for t in insider_txns if "sell" in (t.get("type", "") or "").lower())
+            if buys > sells:
+                adj += 3
+                signals.append(f"CapIQ: net insider buying ({buys}B/{sells}S)")
+            elif sells > buys * 2:
+                adj -= 3
+                signals.append(f"CapIQ: heavy insider selling ({sells}S/{buys}B)")
+
+        # EPS surprises
+        eps_data = capiq.get("earnings", {}).get("eps_estimates_vs_actuals", [])
+        beats = 0
+        for q in eps_data:
+            est = q.get("estimate")
+            act = q.get("actual")
+            if est is not None and act is not None and isinstance(est, (int, float)) and isinstance(act, (int, float)):
+                if act > est:
+                    beats += 1
+        if beats >= 3:
+            adj += 3
+            signals.append(f"CapIQ: beat EPS estimates {beats}/4 quarters")
+
+        # Peer comparison — P/E below sector avg
+        sector_pe = capiq.get("peers", {}).get("sector_avg_pe")
+        sector_growth = capiq.get("peers", {}).get("sector_avg_revenue_growth")
+        if sector_pe and isinstance(sector_pe, (int, float)) and sector_pe > 0:
+            signals.append(f"CapIQ sector avg P/E: {sector_pe:.1f}")
+
+    # --- Orbis ---
+    orbis = berkeley_data.get("orbis", {})
+    if orbis:
+        # Subsidiary complexity as risk factor
+        subs = orbis.get("subsidiaries", [])
+        if len(subs) > 50:
+            adj -= 2
+            signals.append(f"Orbis: complex structure ({len(subs)} subsidiaries)")
+
+        # Comparable companies for context
+        comps = orbis.get("comparables", [])
+        if comps:
+            signals.append(f"Orbis: {len(comps)} peer comparables available")
+
+    # --- Statista ---
+    statista = berkeley_data.get("statista", {})
+    if statista:
+        market_size = statista.get("market_size")
+        if market_size:
+            signals.append(f"Statista TAM: {market_size}")
+
+        forecast = statista.get("market_forecast")
+        if forecast:
+            forecast_lower = forecast.lower()
+            if any(w in forecast_lower for w in ["grow", "increase", "expand", "rise"]):
+                adj += 2
+                signals.append("Statista: growing market forecast")
+            elif any(w in forecast_lower for w in ["decline", "shrink", "contract"]):
+                adj -= 2
+                signals.append("Statista: declining market forecast")
+
+    # Clamp to +-15
+    adj = max(-15, min(15, round(adj)))
+    return adj, signals
+
+
+def calculate_fundamental_score(symbol, berkeley_data=None):
     """
     Calculate fundamental score (0-100) from yfinance data.
+    Optionally enhanced with Berkeley institutional data.
     Returns dict with score, key metrics, key_signals, and market_cap info.
     """
     signals = []
@@ -261,15 +370,28 @@ def calculate_fundamental_score(symbol):
 
     score = max(0, min(100, round(score)))
 
+    # Berkeley enrichment adjustment (supplementary — score works fine without it)
+    berkeley_enhanced = False
+    berkeley_sources = []
+    if berkeley_data:
+        berkeley_adj, berkeley_signals = calculate_berkeley_adjustment(berkeley_data)
+        if berkeley_adj != 0 or berkeley_signals:
+            score = max(0, min(100, score + berkeley_adj))
+            signals.extend(berkeley_signals)
+            berkeley_enhanced = True
+            berkeley_sources = list(berkeley_data.keys())
+
     return {
         'score': score,
         'pe_vs_sector': pe_label,
         'revenue_growth': rev_label,
         'earnings_surprise': earnings_label,
-        'key_signals': signals[:8],
+        'key_signals': signals[:10],
         'market_cap': market_cap,
         'market_cap_category': cap_cat,
         'market_cap_label': cap_label,
+        'berkeley_enhanced': berkeley_enhanced,
+        'berkeley_sources': berkeley_sources,
     }
 
 

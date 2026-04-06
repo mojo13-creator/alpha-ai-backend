@@ -731,3 +731,31 @@ async def dismiss_pending_import(import_id: int):
     """Dismiss a pending import without adding to portfolio"""
     db.delete_pending_import(import_id)
     return {"message": "Dismissed"}
+
+
+# ========== BERKELEY ENRICHMENT ENDPOINT ==========
+from data_collection.berkeley.enrichment_manager import BerkeleyEnrichmentManager
+
+berkeley_enrichment = BerkeleyEnrichmentManager()
+
+@app.get("/api/enrichment/{ticker}")
+async def get_enrichment_data(ticker: str):
+    """Return Berkeley institutional enrichment data for a ticker (testing/debug)."""
+    try:
+        symbol = ticker.upper().strip()
+        if not symbol.isalpha() or len(symbol) > 10:
+            raise HTTPException(status_code=400, detail="Invalid ticker symbol")
+
+        data = await berkeley_enrichment.enrich(symbol)
+        return {
+            "ticker": symbol,
+            "sources": list(data.keys()),
+            "data": data,
+            "generated_at": __import__("datetime").datetime.now().isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

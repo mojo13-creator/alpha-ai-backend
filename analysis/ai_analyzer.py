@@ -34,7 +34,7 @@ class AIStockAnalyzer:
 
     def get_ai_insight_score(self, symbol, price, stock_info, technical_result,
                               fundamental_result, sentiment_result, news_headlines,
-                              df=None):
+                              df=None, berkeley_data=None):
         """
         Call Claude API for the AI Insight sub-score.
         Receives all other sub-scores + raw data. Returns dict with score,
@@ -53,7 +53,8 @@ class AIStockAnalyzer:
             # Build the data package for Claude
             prompt = self._build_prompt(
                 symbol, price, stock_info, technical_result,
-                fundamental_result, sentiment_result, news_headlines, df
+                fundamental_result, sentiment_result, news_headlines, df,
+                berkeley_data
             )
 
             message = client.messages.create(
@@ -70,7 +71,7 @@ class AIStockAnalyzer:
             return self._fallback_result(str(e))
 
     def _build_prompt(self, symbol, price, stock_info, technical, fundamental,
-                      sentiment, news_headlines, df):
+                      sentiment, news_headlines, df, berkeley_data=None):
         """Build the decisive analyst prompt with all data."""
 
         # Gather technical details from the dataframe
@@ -139,6 +140,8 @@ PRE-COMPUTED SUB-SCORES (from our quantitative models):
 
 {news_block}
 
+{self._build_berkeley_block(berkeley_data)}
+
 YOUR TASK:
 1. Review ALL the data above
 2. Identify patterns the quantitative models might miss (sector rotation, macro correlation, earnings setup, competitive dynamics)
@@ -171,6 +174,81 @@ Respond ONLY with valid JSON in this exact format:
 }}"""
 
         return prompt
+
+    def _build_berkeley_block(self, berkeley_data):
+        """Build the institutional data section for the prompt."""
+        if not berkeley_data:
+            return ""
+
+        lines = ["INSTITUTIONAL DATA (from Capital IQ / Orbis / Statista — treat as high-quality signals):"]
+
+        capiq = berkeley_data.get("capital_iq", {})
+        if capiq:
+            analyst = capiq.get("analyst", {})
+            if analyst.get("consensus"):
+                lines.append(f"  Analyst consensus: {analyst['consensus']}")
+            pt_low = analyst.get("price_target_low")
+            pt_mean = analyst.get("price_target_mean")
+            pt_high = analyst.get("price_target_high")
+            if pt_mean:
+                lines.append(f"  Price target range: ${pt_low or '?'} - ${pt_mean} - ${pt_high or '?'}")
+
+            own = capiq.get("ownership", {})
+            if own.get("institutional_pct"):
+                lines.append(f"  Institutional ownership: {own['institutional_pct']*100:.0f}%")
+            insider = own.get("insider_transactions", [])
+            if insider:
+                buys = sum(1 for t in insider if "buy" in (t.get("type", "") or "").lower())
+                sells = sum(1 for t in insider if "sell" in (t.get("type", "") or "").lower())
+                lines.append(f"  Insider activity: {buys} buys, {sells} sells (last 6 months)")
+
+            peers = capiq.get("peers", {})
+            if peers.get("sector_avg_pe"):
+                lines.append(f"  Sector avg P/E: {peers['sector_avg_pe']}")
+            if peers.get("sector_avg_revenue_growth"):
+                lines.append(f"  Sector avg revenue growth: {peers['sector_avg_revenue_growth']*100:.1f}%")
+
+            earnings = capiq.get("earnings", {})
+            if earnings.get("next_earnings_date"):
+                lines.append(f"  Next earnings date: {earnings['next_earnings_date']}")
+
+        orbis = berkeley_data.get("orbis", {})
+        if orbis:
+            subs = orbis.get("subsidiaries", [])
+            if subs:
+                lines.append(f"  Corporate structure: {len(subs)} subsidiaries")
+            comps = orbis.get("comparables", [])
+            if comps:
+                comp_names = [c.get("name", "") for c in comps[:5] if c.get("name")]
+                if comp_names:
+                    lines.append(f"  Comparable companies: {', '.join(comp_names)}")
+
+        statista = berkeley_data.get("statista", {})
+        if statista:
+            if statista.get("market_size"):
+                lines.append(f"  Market size / TAM: {statista['market_size']}")
+            if statista.get("market_forecast"):
+                lines.append(f"  Market forecast: {statista['market_forecast'][:200]}")
+
+        ibisworld = berkeley_data.get("ibisworld", {})
+        if ibisworld:
+            if ibisworld.get("outlook"):
+                lines.append(f"  Industry outlook: {ibisworld['outlook'][:200]}")
+            if ibisworld.get("growth_rate"):
+                lines.append(f"  Industry growth rate: {ibisworld['growth_rate']}")
+
+        fitch = berkeley_data.get("fitch", {})
+        if fitch:
+            if fitch.get("company_rating"):
+                lines.append(f"  Fitch rating: {fitch['company_rating']}")
+            if fitch.get("sector_credit_outlook"):
+                lines.append(f"  Sector credit outlook: {fitch['sector_credit_outlook'][:200]}")
+
+        if len(lines) <= 1:
+            return ""
+
+        lines.append("\nUse this institutional data to validate or challenge your analysis. If your score disagrees with analyst consensus, explain why specifically.")
+        return "\n".join(lines)
 
     def _parse_response(self, response_text):
         """Parse Claude's JSON response."""

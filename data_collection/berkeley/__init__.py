@@ -1,0 +1,11 @@
+# Berkeley institutional database scrapers
+# Requires CalNet authentication for most platforms
+
+from data_collection.berkeley.enrichment_manager import BerkeleyEnrichmentManager
+from data_collection.berkeley.capiq_scraper import CapIQScraper
+from data_collection.berkeley.ibisworld_scraper import IBISWorldScraper
+from data_collection.berkeley.fitch_scraper import FitchScraper
+from data_collection.berkeley.orbis_scraper import OrbisScraper
+from data_collection.berkeley.finaeon_scraper import FinaeonScraper
+from data_collection.berkeley.statista_scraper import StatistaScraper
+from data_collection.berkeley.wrds_client import WRDSClient

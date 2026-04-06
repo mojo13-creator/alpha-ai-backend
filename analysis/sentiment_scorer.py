@@ -219,7 +219,60 @@ def score_finviz_signals(finviz_data, symbol):
     return adjustment, signals
 
 
-def calculate_sentiment_score(news_articles, reddit_scraper=None, symbol='', finviz_data=None):
+def _berkeley_sentiment_adjustment(berkeley_data):
+    """
+    Extract sentiment-relevant signals from Berkeley data.
+    Returns (adjustment_points, signals_list). Max +-10 points.
+    """
+    if not berkeley_data:
+        return 0, []
+
+    adj = 0.0
+    signals = []
+
+    # Capital IQ analyst consensus shifts as sentiment signals
+    capiq = berkeley_data.get("capital_iq", {})
+    if capiq:
+        consensus = (capiq.get("analyst", {}).get("consensus") or "").lower()
+        if "strong buy" in consensus or "overweight" in consensus:
+            adj += 4
+            signals.append(f"CapIQ institutional consensus: bullish")
+        elif "sell" in consensus or "underweight" in consensus:
+            adj -= 4
+            signals.append(f"CapIQ institutional consensus: bearish")
+
+    # Statista consumer trends
+    statista = berkeley_data.get("statista", {})
+    if statista:
+        trends = statista.get("consumer_trends", [])
+        if trends:
+            adj += 2
+            signals.append(f"Statista: {len(trends)} relevant consumer trend(s)")
+
+    # IBISWorld industry outlook as macro sentiment
+    ibisworld = berkeley_data.get("ibisworld", {})
+    if ibisworld:
+        outlook = (ibisworld.get("outlook") or "").lower()
+        if any(w in outlook for w in ["growing", "positive", "strong"]):
+            adj += 3
+            signals.append("IBISWorld: positive industry outlook")
+        elif any(w in outlook for w in ["declining", "negative", "weak"]):
+            adj -= 3
+            signals.append("IBISWorld: negative industry outlook")
+
+    # Fitch macro risk context
+    fitch = berkeley_data.get("fitch", {})
+    if fitch:
+        risks = fitch.get("macro_risk_factors", [])
+        if len(risks) >= 3:
+            adj -= 2
+            signals.append(f"Fitch: {len(risks)} macro risk factors flagged")
+
+    return max(-10, min(10, round(adj))), signals
+
+
+def calculate_sentiment_score(news_articles, reddit_scraper=None, symbol='',
+                               finviz_data=None, berkeley_data=None):
     """
     Master function: calculates composite sentiment score (0-100).
     Returns dict with score, sub-components, and key_signals.
@@ -236,23 +289,33 @@ def calculate_sentiment_score(news_articles, reddit_scraper=None, symbol='', fin
     # Finviz: 25% weight (applied as adjustment)
     finviz_adj, finviz_signals = score_finviz_signals(finviz_data, symbol)
 
-    # Composite: news 50%, reddit 25%, finviz adjusts the base
+    # Berkeley institutional sentiment (supplementary adjustment)
+    berkeley_adj, berkeley_signals = _berkeley_sentiment_adjustment(berkeley_data)
+
+    # Composite: news 50%, reddit 25%, finviz + berkeley adjust the base
     base_score = news_score * 0.50 + reddit_score * 0.25 + 50 * 0.25
-    composite = base_score + finviz_adj
+    composite = base_score + finviz_adj + berkeley_adj
     composite = max(0, min(100, round(composite)))
 
-    all_signals = news_signals + reddit_signals + finviz_signals
+    all_signals = news_signals + reddit_signals + finviz_signals + berkeley_signals
     analyst_label = 'N/A'
     for sig in finviz_signals:
         if 'upgrade' in sig.lower():
             analyst_label = 'Upgraded'
         elif 'insider' in sig.lower():
             analyst_label = 'Insider buying'
+    # Berkeley can also provide analyst label
+    if analyst_label == 'N/A' and berkeley_signals:
+        for sig in berkeley_signals:
+            if 'bullish' in sig.lower():
+                analyst_label = 'Institutional bullish'
+            elif 'bearish' in sig.lower():
+                analyst_label = 'Institutional bearish'
 
     return {
         'score': composite,
         'news_sentiment': news_label,
         'reddit_buzz': f'{buzz_label} and {"positive" if reddit_score > 55 else "negative" if reddit_score < 45 else "neutral"}',
         'analyst_consensus': analyst_label,
-        'key_signals': all_signals[:8],
+        'key_signals': all_signals[:10],
     }

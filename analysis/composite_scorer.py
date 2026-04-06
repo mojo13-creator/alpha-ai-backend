@@ -156,12 +156,14 @@ def calculate_action(signal, price, atr, df=None):
 
 
 def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
-                            reddit_scraper=None, finviz_data=None, skip_ai=False):
+                            reddit_scraper=None, finviz_data=None, skip_ai=False,
+                            use_berkeley=True):
     """
     Run the full composite analysis pipeline for a symbol.
     Returns the complete analysis result dict matching the API response schema.
     """
     import yfinance as yf
+    import asyncio
     from data_collection.stock_data import StockDataCollector
 
     print(f"\n{'='*60}")
@@ -196,14 +198,47 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
     except Exception:
         stock_info = {}
 
+    # 2b. Berkeley enrichment (best-effort, non-blocking)
+    berkeley_data = {}
+    berkeley_sources_available = []
+    berkeley_sources_failed = []
+    if use_berkeley:
+        print(f"\n🏛️  Phase 0: Berkeley Enrichment...")
+        try:
+            from data_collection.berkeley.enrichment_manager import BerkeleyEnrichmentManager
+            enrichment = BerkeleyEnrichmentManager()
+
+            # Run async enrichment from sync context
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        berkeley_data = pool.submit(
+                            asyncio.run, enrichment.enrich(symbol)
+                        ).result(timeout=120)
+                else:
+                    berkeley_data = loop.run_until_complete(enrichment.enrich(symbol))
+            except RuntimeError:
+                berkeley_data = asyncio.run(enrichment.enrich(symbol))
+
+            berkeley_sources_available = list(berkeley_data.keys())
+            all_berkeley = ["capital_iq", "wrds", "ibisworld", "fitch", "orbis", "finaeon", "statista"]
+            berkeley_sources_failed = [s for s in all_berkeley if s not in berkeley_sources_available]
+            print(f"  Berkeley sources: {berkeley_sources_available or 'none'}")
+        except Exception as e:
+            print(f"  ⚠️  Berkeley enrichment unavailable: {e}")
+
     # 3. Technical Score
     tech_result = calculate_technical_score(df)
     print(f"  Technical Score: {tech_result['score']}/100")
 
-    # 4. Fundamental Score
+    # 4. Fundamental Score (enhanced with Berkeley data if available)
     print(f"\n📊 Phase 2: Fundamental Analysis...")
-    fund_result = calculate_fundamental_score(symbol)
+    fund_result = calculate_fundamental_score(symbol, berkeley_data=berkeley_data or None)
     print(f"  Fundamental Score: {fund_result['score']}/100")
+    if fund_result.get('berkeley_enhanced'):
+        print(f"  (Berkeley-enhanced from: {fund_result.get('berkeley_sources', [])})")
 
     # Market cap classification
     market_cap = fund_result.get('market_cap', 0)
@@ -223,6 +258,7 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         reddit_scraper=reddit_scraper,
         symbol=symbol,
         finviz_data=finviz_data,
+        berkeley_data=berkeley_data or None,
     )
     print(f"  Sentiment Score: {sent_result['score']}/100")
 
@@ -247,6 +283,7 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
             sentiment_result=sent_result,
             news_headlines=news_articles[:8],
             df=df,
+            berkeley_data=berkeley_data or None,
         )
         print(f"  AI Insight Score: {ai_result['score']}/100")
 
@@ -266,6 +303,16 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         composite, tech_result['score'], fund_result['score'],
         sent_result['score'], ai_result['score']
     )
+
+    # Confidence boost from Berkeley data breadth
+    confidence_tiers = ['LOW', 'MODERATE', 'HIGH']
+    num_berkeley = len(berkeley_sources_available)
+    if num_berkeley >= 5 and confidence in confidence_tiers:
+        idx = confidence_tiers.index(confidence)
+        confidence = confidence_tiers[min(idx + 2, 2)]
+    elif num_berkeley >= 3 and confidence in confidence_tiers:
+        idx = confidence_tiers.index(confidence)
+        confidence = confidence_tiers[min(idx + 1, 2)]
 
     # 9. Action calculation (entry, stop, target)
     atr = safe_float(latest.get('ATR', 0))
@@ -417,4 +464,16 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         'news': news_list,
         'price_history': price_history,
         'reasoning': ai_result.get('reasoning', f'Composite score: {composite}/100. Signal: {signal}.'),
+        'data_quality': {
+            'sources_available': (
+                ['yfinance', 'newsapi']
+                + (['reddit'] if reddit_scraper else [])
+                + (['finviz'] if finviz_data else [])
+                + berkeley_sources_available
+            ),
+            'sources_failed': berkeley_sources_failed,
+            'berkeley_enhanced': bool(berkeley_sources_available),
+            'berkeley_source_count': num_berkeley,
+            'confidence_boost': num_berkeley >= 3,
+        },
     }
