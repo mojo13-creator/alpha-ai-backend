@@ -85,21 +85,45 @@ class TechnicalAnalyzer:
         """Calculate Average Directional Index (ADX)"""
         df['high_diff'] = df['high'].diff()
         df['low_diff'] = df['low'].diff()
-        
+
         df['+DM'] = np.where((df['high_diff'] > df['low_diff']) & (df['high_diff'] > 0), df['high_diff'], 0)
         df['-DM'] = np.where((df['low_diff'] > df['high_diff']) & (df['low_diff'] > 0), df['low_diff'], 0)
-        
+
         if 'ATR' not in df.columns:
             df = self.calculate_atr(df, period)
-        
+
         df['+DI'] = 100 * (df['+DM'].rolling(window=period).mean() / df['ATR'])
         df['-DI'] = 100 * (df['-DM'].rolling(window=period).mean() / df['ATR'])
-        
+
         df['DX'] = 100 * np.abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI'])
         df['ADX'] = df['DX'].rolling(window=period).mean()
-        
+
         df.drop(['high_diff', 'low_diff', '+DM', '-DM'], axis=1, inplace=True)
-        
+
+        return df
+
+    def calculate_obv(self, df):
+        """Calculate On-Balance Volume (OBV)"""
+        obv = [0]
+        for i in range(1, len(df)):
+            if df['close'].iloc[i] > df['close'].iloc[i - 1]:
+                obv.append(obv[-1] + df['volume'].iloc[i])
+            elif df['close'].iloc[i] < df['close'].iloc[i - 1]:
+                obv.append(obv[-1] - df['volume'].iloc[i])
+            else:
+                obv.append(obv[-1])
+        df['OBV'] = obv
+        df['OBV_SMA_20'] = df['OBV'].rolling(window=20).mean()
+        return df
+
+    def calculate_keltner_channels(self, df, period=20, atr_mult=1.5):
+        """Calculate Keltner Channels for squeeze detection"""
+        if 'ATR' not in df.columns:
+            df = self.calculate_atr(df)
+        ema = df['close'].ewm(span=period, adjust=False).mean()
+        df['KC_Upper'] = ema + (atr_mult * df['ATR'])
+        df['KC_Lower'] = ema - (atr_mult * df['ATR'])
+        df['KC_Middle'] = ema
         return df
     
     def calculate_all_indicators(self, symbol, period='1y'):
@@ -116,27 +140,33 @@ class TechnicalAnalyzer:
         df = df.set_index('date')
         
         print("   📊 Calculating Moving Averages...")
-        df = self.calculate_sma(df, [20, 50, 200])
-        df = self.calculate_ema(df, [12, 26])
-        
+        df = self.calculate_sma(df, [20, 50, 100, 200])
+        df = self.calculate_ema(df, [9, 12, 21, 26])
+
         print("   📊 Calculating RSI...")
         df = self.calculate_rsi(df)
-        
+
         print("   📊 Calculating MACD...")
         df = self.calculate_macd(df)
-        
+
         print("   📊 Calculating Bollinger Bands...")
         df = self.calculate_bollinger_bands(df)
-        
+
         print("   📊 Calculating ATR...")
         df = self.calculate_atr(df)
-        
+
         print("   📊 Calculating Stochastic...")
         df = self.calculate_stochastic(df)
-        
+
         print("   📊 Calculating ADX...")
         df = self.calculate_adx(df)
-        
+
+        print("   📊 Calculating OBV...")
+        df = self.calculate_obv(df)
+
+        print("   📊 Calculating Keltner Channels...")
+        df = self.calculate_keltner_channels(df)
+
         print(f"✅ All indicators calculated for {symbol.upper()}")
         
         return df

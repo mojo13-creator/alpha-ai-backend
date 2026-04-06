@@ -131,6 +131,27 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS analysis_history (
+                    id SERIAL PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    composite_score INTEGER,
+                    technical_score INTEGER,
+                    fundamental_score INTEGER,
+                    sentiment_score INTEGER,
+                    ai_insight_score INTEGER,
+                    signal TEXT,
+                    confidence TEXT,
+                    risk_level TEXT,
+                    entry_price REAL,
+                    stop_loss REAL,
+                    target_price REAL,
+                    weight_profile TEXT,
+                    market_cap_category TEXT,
+                    raw_response TEXT
+                )
+            """)
         else:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS stock_prices (
@@ -215,6 +236,27 @@ class DatabaseManager:
                     source TEXT DEFAULT 'gmail',
                     email_id TEXT UNIQUE,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS analysis_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    composite_score INTEGER,
+                    technical_score INTEGER,
+                    fundamental_score INTEGER,
+                    sentiment_score INTEGER,
+                    ai_insight_score INTEGER,
+                    signal TEXT,
+                    confidence TEXT,
+                    risk_level TEXT,
+                    entry_price REAL,
+                    stop_loss REAL,
+                    target_price REAL,
+                    weight_profile TEXT,
+                    market_cap_category TEXT,
+                    raw_response TEXT
                 )
             """)
 
@@ -539,3 +581,44 @@ class DatabaseManager:
         cursor.execute("DELETE FROM pending_imports")
         conn.commit()
         conn.close()
+
+    # ========== ANALYSIS HISTORY OPERATIONS ==========
+
+    def save_analysis_history(self, ticker, composite_score, technical_score,
+                               fundamental_score, sentiment_score, ai_insight_score,
+                               signal, confidence, risk_level, entry_price,
+                               stop_loss, target_price, weight_profile,
+                               market_cap_category, raw_response=None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"""
+                INSERT INTO analysis_history
+                (ticker, composite_score, technical_score, fundamental_score,
+                 sentiment_score, ai_insight_score, signal, confidence, risk_level,
+                 entry_price, stop_loss, target_price, weight_profile,
+                 market_cap_category, raw_response)
+                VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})
+            """, (ticker.upper(), composite_score, technical_score, fundamental_score,
+                  sentiment_score, ai_insight_score, signal, confidence, risk_level,
+                  entry_price, stop_loss, target_price, weight_profile,
+                  market_cap_category, raw_response))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"⚠️  Error saving analysis history: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def get_analysis_history(self, ticker, limit=30):
+        conn = self.get_connection()
+        query = f"""
+            SELECT * FROM analysis_history
+            WHERE ticker = {PH}
+            ORDER BY timestamp DESC
+            LIMIT {limit}
+        """
+        df = pd.read_sql_query(query, conn, params=(ticker.upper(),))
+        conn.close()
+        return df

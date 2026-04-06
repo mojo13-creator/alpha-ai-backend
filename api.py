@@ -53,110 +53,52 @@ def root():
 @app.post("/api/analyze")
 async def analyze_stock(request: AnalysisRequest):
     symbol = request.symbol.upper()
-    period = request.period
-    
+
     try:
-        print(f"\n📊 Fetching data for {symbol}...")
-        collector.fetch_stock_data(symbol, period=period)
-        
-        latest_price = db.get_latest_price(symbol)
-        if not latest_price:
-            raise HTTPException(status_code=404, detail=f"No data found for {symbol}")
-        
-        # Get real-time price + previous close from yfinance
+        from analysis.composite_scorer import run_composite_analysis
+
+        # Initialize reddit scraper if available
+        reddit_scraper_instance = None
         try:
-            import yfinance as yf
-            ticker = yf.Ticker(symbol)
-            fast = ticker.fast_info
-            realtime_price = float(fast.last_price) if fast.last_price else None
-            if not realtime_price:
-                realtime_price = float(fast.regular_market_price) if hasattr(fast, 'regular_market_price') and fast.regular_market_price else None
-            prev_close = float(fast.previous_close) if hasattr(fast, 'previous_close') and fast.previous_close else None
+            reddit_scraper_instance = RedditScraper(db)
+            if reddit_scraper_instance.reddit is None:
+                reddit_scraper_instance = None
         except Exception:
-            realtime_price = None
-            prev_close = None
-        
-        print(f"📈 Calculating indicators...")
-        df = analyzer.calculate_all_indicators(symbol)
-        
-        if df is None or len(df) == 0:
-            raise HTTPException(status_code=500, detail="Technical analysis failed")
-        
-        latest = df.iloc[-1]
-        price = realtime_price if realtime_price else float(latest['close'])
-        print(f"💰 Real-time price for {symbol}: ${price:.2f}")
-        
-        print(f"🤖 Getting recommendation...")
-        result = recommender.analyze_and_recommend(symbol)
-        
-        if not result:
-            raise HTTPException(status_code=500, detail="AI analysis failed")
-        
-        news_list = []
-        reddit_data = {}
+            pass
+
+        # Get finviz data (non-blocking, best-effort)
+        finviz_data = None
         try:
-            print(f"🔴 Fetching Reddit sentiment...")
-            reddit_data = fetch_reddit_sentiment(symbol)
-            print(f"✅ Reddit: {reddit_data['sentiment_label']} ({reddit_data['sentiment_score']}/100)")
-            print(f"📰 Fetching news...")
-            news_articles = news_scraper.fetch_stock_news(symbol, days=7)
-            if news_articles and len(news_articles) > 0:
-                news_list = [
-                    {
-                        "title": article.get('title', 'No title'),
-                        "source": article.get('source', 'Unknown'),
-                        "url": article.get('url', ''),
-                        "published": article.get('published', '')
-                    }
-                    for article in news_articles[:5]
-                ]
-        except Exception as e:
-            print(f"⚠️  News/Reddit fetch error: {e}")
-        
-        technical_data = {
-            "rsi": safe_float(latest.get('RSI', 50), 50),
-            "macd": safe_float(latest.get('MACD', 0)),
-            "macd_signal": safe_float(latest.get('MACD_Signal', 0)),
-            "sma_20": safe_float(latest.get('SMA_20', price), price),
-            "sma_50": safe_float(latest.get('SMA_50', price), price),
-            "sma_200": safe_float(latest.get('SMA_200', price), price),
-            "volume": int(latest.get('volume', 0)),
-            "bb_upper": safe_float(latest.get('BB_Upper', price), price),
-            "bb_lower": safe_float(latest.get('BB_Lower', price), price),
-        }
-        
-        response = {
-            "symbol": symbol,
-            "price": realtime_price if realtime_price else float(result.get('price', price)),
-            "prev_close": prev_close,
-            "price_change": round(realtime_price - prev_close, 2) if realtime_price and prev_close else 0.0,
-            "price_change_pct": round(((realtime_price - prev_close) / prev_close) * 100, 2) if realtime_price and prev_close else 0.0,
-            "recommendation": result.get('recommendation', 'HOLD'),
-            "score": int(result.get('score', 50)),
-            "reasoning": str(result.get('reasoning', 'Analysis complete')),
-            "timestamp": str(result.get('timestamp', '')),
-            "technical_data": technical_data,
-            "news": news_list,
-        }
-        
-        # Get price history
-        price_rows = db.get_stock_prices(symbol, limit=365)
-        price_history = []
-        if price_rows is not None and not price_rows.empty:
-            for _, row in price_rows.iterrows():
-                price_history.append({
-                    "date": str(row["date"]),
-                    "close": float(row["close"]),
-                    "open": float(row["open"]) if row["open"] else float(row["close"]),
-                    "high": float(row["high"]) if row["high"] else float(row["close"]),
-                    "low": float(row["low"]) if row["low"] else float(row["close"]),
-                    "volume": int(row["volume"]) if row["volume"] else 0,
-                })
-        response["price_history"] = price_history
-        response["reddit"] = reddit_data
-        print(f"✅ Analysis complete for {symbol}")
-        return response
-    
+            finviz_data = finviz.get_all_signals()
+        except Exception:
+            pass
+
+        result = run_composite_analysis(
+            symbol=symbol,
+            db_manager=db,
+            technical_analyzer=analyzer,
+            news_scraper=news_scraper,
+            reddit_scraper=reddit_scraper_instance,
+            finviz_data=finviz_data,
+        )
+
+        if 'error' in result:
+            raise HTTPException(status_code=404, detail=result['error'])
+
+        # Save recommendation to DB
+        db.save_recommendation(
+            symbol=symbol,
+            recommendation=result.get('recommendation', 'HOLD'),
+            score=result.get('composite_score', 50),
+            reasoning=result.get('reasoning', ''),
+            price=result.get('price', 0),
+            target_price=result.get('action', {}).get('target_price'),
+            stop_loss=result.get('action', {}).get('stop_loss'),
+        )
+
+        print(f"✅ Composite analysis complete for {symbol}")
+        return result
+
     except HTTPException:
         raise
     except Exception as e:
@@ -673,6 +615,39 @@ async def get_strong_buys():
         results = finviz.get_strong_buys()
         return {"stocks": results, "count": len(results)}
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== ANALYSIS HISTORY ENDPOINT ==========
+
+@app.get("/api/analysis/{ticker}/history")
+async def get_analysis_history(ticker: str):
+    """Return last 30 analyses for a ticker for score trend charting."""
+    try:
+        symbol = ticker.upper()
+        df = db.get_analysis_history(symbol, limit=30)
+
+        history = []
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                history.append({
+                    "date": str(row.get("timestamp", "")),
+                    "composite_score": int(row.get("composite_score", 50)),
+                    "technical_score": int(row.get("technical_score", 50)),
+                    "fundamental_score": int(row.get("fundamental_score", 50)),
+                    "sentiment_score": int(row.get("sentiment_score", 50)),
+                    "ai_insight_score": int(row.get("ai_insight_score", 50)),
+                    "signal": str(row.get("signal", "HOLD")),
+                    "confidence": str(row.get("confidence", "")),
+                    "entry_price": float(row.get("entry_price", 0)) if row.get("entry_price") else None,
+                    "target_price": float(row.get("target_price", 0)) if row.get("target_price") else None,
+                    "stop_loss": float(row.get("stop_loss", 0)) if row.get("stop_loss") else None,
+                })
+
+        return {"ticker": symbol, "history": history, "count": len(history)}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
