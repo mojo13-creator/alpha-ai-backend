@@ -242,101 +242,238 @@ class PortfolioRequest(BaseModel):
     purchase_price: float
     purchase_date: str = ""
     notes: str = ""
+    tier: str = "midcap_active"
+    stop_loss: float = 0
+    target_price: float = 0
+    signal: str = ""
+    source: str = "manual"
+
+class PortfolioUpdateRequest(BaseModel):
+    tier: str = ""
+    stop_loss: float = 0
+    target_price: float = 0
+    shares: float = 0
+    notes: str = ""
 
 @app.get("/api/portfolio")
 async def get_portfolio():
+    """Returns all positions separated by tier with current scores and P&L."""
     try:
         import yfinance as yf
-        import sqlite3
-        conn = sqlite3.connect("stock_data.db")
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM portfolio ORDER BY symbol")
-        rows = cursor.fetchall()
-        conn.close()
 
-        positions = []
-        total_value = 0
-        total_cost = 0
+        positions = db.get_active_positions()
+        tier_1_positions = []
+        tier_2_positions = []
+        tier_1_value = 0
+        tier_1_cost = 0
+        tier_2_value = 0
+        tier_2_cost = 0
+        all_alerts = []
+        last_scored = None
 
-        for row in rows:
-            symbol = row["symbol"]
-            shares = float(row["shares"] or 0)
-            purchase_price = float(row["purchase_price"] or 0)
-            try:
-                ticker = yf.Ticker(symbol)
-                info = ticker.fast_info
-                current_price = float(info.last_price)
-            except:
-                current_price = purchase_price
+        for pos in positions:
+            symbol = pos["symbol"]
+            shares = safe_float(pos.get("shares", 0))
+            entry_price = safe_float(pos.get("purchase_price", 0))
+
+            # Use cached current_price if scored recently, otherwise fetch live
+            current_price = safe_float(pos.get("current_price", 0))
+            if current_price <= 0:
+                try:
+                    ticker_obj = yf.Ticker(symbol)
+                    current_price = float(ticker_obj.fast_info.last_price)
+                except Exception:
+                    current_price = entry_price
 
             market_value = shares * current_price
-            cost_basis = shares * purchase_price
+            cost_basis = shares * entry_price
             pnl = market_value - cost_basis
-            pnl_pct = ((current_price - purchase_price) / purchase_price * 100) if purchase_price > 0 else 0
+            pnl_pct = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
 
-            total_value += market_value
-            total_cost += cost_basis
+            scored_at = pos.get("last_scored_at")
+            if scored_at and (last_scored is None or str(scored_at) > str(last_scored)):
+                last_scored = scored_at
 
-            positions.append({
-                "id": row["id"],
-                "symbol": symbol,
+            position_data = {
+                "id": pos["id"],
+                "ticker": symbol,
                 "shares": shares,
-                "purchase_price": round(purchase_price, 2),
+                "entry_price": round(entry_price, 2),
                 "current_price": round(current_price, 2),
-                "market_value": round(market_value, 2),
-                "cost_basis": round(cost_basis, 2),
-                "pnl": round(pnl, 2),
-                "pnl_pct": round(pnl_pct, 2),
-                "purchase_date": row["purchase_date"] or "",
-                "notes": row["notes"] or "",
-            })
+                "total_invested": round(cost_basis, 2),
+                "unrealized_pnl": round(pnl, 2),
+                "unrealized_pnl_pct": round(pnl_pct, 2),
+                "composite_score": pos.get("current_score"),
+                "health": pos.get("health", "healthy"),
+                "alert": pos.get("alert"),
+                "stop_loss": safe_float(pos.get("stop_loss", 0)) or None,
+                "target_price": safe_float(pos.get("target_price", 0)) or None,
+                "signal": pos.get("signal", ""),
+                "source": pos.get("source", "manual"),
+                "notes": pos.get("notes", ""),
+                "purchase_date": str(pos.get("purchase_date", "")),
+            }
 
+            tier = pos.get("tier", "midcap_active")
+            if tier == "long_term":
+                tier_1_positions.append(position_data)
+                tier_1_value += market_value
+                tier_1_cost += cost_basis
+            else:
+                tier_2_positions.append(position_data)
+                tier_2_value += market_value
+                tier_2_cost += cost_basis
+
+            # Collect alerts
+            if pos.get("alert"):
+                severity = "high" if pos.get("health") in ("danger", "stop_loss") else \
+                           "medium" if pos.get("health") == "take_profit" else "low"
+                all_alerts.append({
+                    "ticker": symbol,
+                    "type": pos.get("health", "watch"),
+                    "message": pos["alert"],
+                    "severity": severity,
+                })
+
+        total_value = tier_1_value + tier_2_value
+        total_cost = tier_1_cost + tier_2_cost
         total_pnl = total_value - total_cost
         total_pnl_pct = ((total_value - total_cost) / total_cost * 100) if total_cost > 0 else 0
 
         return {
-            "positions": positions,
-            "summary": {
-                "total_value": round(total_value, 2),
-                "total_cost": round(total_cost, 2),
-                "total_pnl": round(total_pnl, 2),
-                "total_pnl_pct": round(total_pnl_pct, 2),
-                "position_count": len(positions),
-            }
+            "portfolio_value": round(total_value, 2),
+            "total_pnl": round(total_pnl, 2),
+            "total_pnl_pct": round(total_pnl_pct, 2),
+            "last_scored_at": str(last_scored) if last_scored else None,
+            "tier_1": {
+                "label": "Long-Term Holdings",
+                "positions": tier_1_positions,
+                "subtotal": round(tier_1_value, 2),
+                "subtotal_pnl": round(tier_1_value - tier_1_cost, 2),
+            },
+            "tier_2": {
+                "label": "Active Midcap",
+                "positions": tier_2_positions,
+                "subtotal": round(tier_2_value, 2),
+                "subtotal_pnl": round(tier_2_value - tier_2_cost, 2),
+            },
+            "alerts": all_alerts,
         }
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/portfolio")
-async def add_position(request: PortfolioRequest):
+
+@app.get("/api/portfolio/alerts")
+async def get_portfolio_alerts():
+    """Returns only positions with active alerts."""
     try:
-        import sqlite3
-        conn = sqlite3.connect("stock_data.db")
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO portfolio (symbol, shares, purchase_price, purchase_date, notes, last_updated)
-            VALUES (?, ?, ?, ?, ?, datetime('now'))
-        """, (request.symbol.upper(), request.shares, request.purchase_price,
-              request.purchase_date, request.notes))
-        conn.commit()
-        conn.close()
-        return {"message": f"Added {request.symbol.upper()} to portfolio"}
+        rows = db.get_positions_with_alerts()
+        alerts = []
+        for pos in rows:
+            severity = "high" if pos.get("health") in ("danger", "stop_loss") else \
+                       "medium" if pos.get("health") == "take_profit" else "low"
+            alerts.append({
+                "id": pos["id"],
+                "ticker": pos["symbol"],
+                "tier": pos.get("tier", "midcap_active"),
+                "type": pos.get("health", "watch"),
+                "message": pos.get("alert", ""),
+                "severity": severity,
+                "composite_score": pos.get("current_score"),
+                "current_price": safe_float(pos.get("current_price", 0)),
+            })
+        return {"alerts": alerts, "count": len(alerts)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/api/portfolio/score-all")
+async def score_all_positions():
+    """Trigger scoring of all active positions on demand."""
+    try:
+        from analysis.portfolio_scorer import PortfolioScorer
+
+        scorer = PortfolioScorer(db, analyzer, news_scraper)
+        print("\n" + "=" * 60)
+        print("  PORTFOLIO SCORING — ALL POSITIONS")
+        print("=" * 60)
+        results = scorer.score_all_positions()
+        print("=" * 60)
+        print(f"  Scored {len(results)} positions")
+        print("=" * 60 + "\n")
+
+        return {
+            "scored": len(results),
+            "results": results,
+            "scored_at": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/portfolio")
+async def add_position(request: PortfolioRequest):
+    try:
+        symbol = request.symbol.upper().strip()
+        if not symbol.isalpha() or len(symbol) > 10:
+            raise HTTPException(status_code=400, detail="Invalid ticker symbol")
+
+        row_id = db.add_portfolio_position(
+            symbol=symbol,
+            shares=request.shares,
+            purchase_price=request.purchase_price,
+            purchase_date=request.purchase_date if request.purchase_date else None,
+            notes=request.notes,
+            tier=request.tier,
+            stop_loss=request.stop_loss if request.stop_loss > 0 else None,
+            target_price=request.target_price if request.target_price > 0 else None,
+            signal=request.signal if request.signal else None,
+            source=request.source,
+        )
+        return {"message": f"Added {symbol} to portfolio", "id": row_id, "ticker": symbol}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/portfolio/{position_id}")
+async def update_position(position_id: int, request: PortfolioUpdateRequest):
+    """Update a position (change tier, stop loss, target, shares, notes)."""
+    try:
+        updates = {}
+        if request.tier:
+            updates["tier"] = request.tier
+        if request.stop_loss > 0:
+            updates["stop_loss"] = request.stop_loss
+        if request.target_price > 0:
+            updates["target_price"] = request.target_price
+        if request.shares > 0:
+            updates["shares"] = request.shares
+        if request.notes:
+            updates["notes"] = request.notes
+        if updates:
+            updates["last_updated"] = datetime.now()
+            db.update_position(position_id, **updates)
+        return {"message": f"Updated position {position_id}", "updated_fields": list(updates.keys())}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/api/portfolio/{position_id}")
 async def delete_position(position_id: int):
+    """Mark position as closed (soft delete)."""
     try:
-        import sqlite3
-        conn = sqlite3.connect("stock_data.db")
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM portfolio WHERE id = ?", (position_id,))
-        conn.commit()
-        conn.close()
-        return {"message": "Position removed"}
+        closed = db.close_position(position_id)
+        if not closed:
+            raise HTTPException(status_code=404, detail="Position not found")
+        return {"message": f"Position {position_id} closed"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -349,32 +486,28 @@ class ReportPickPortfolioRequest(BaseModel):
     signal: str
     source: str = "daily_report"
     tier: str = "midcap_active"
+    shares: float = 0
 
 @app.post("/api/portfolio/from-report")
 async def add_report_pick_to_portfolio(request: ReportPickPortfolioRequest):
     """Add a daily report pick to the portfolio tracking table."""
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
         symbol = request.ticker.upper().strip()
         if not symbol.isalpha() or len(symbol) > 10:
             raise HTTPException(status_code=400, detail="Invalid ticker symbol")
 
-        if os.environ.get("DATABASE_URL"):
-            cursor.execute("""
-                INSERT INTO portfolio (symbol, shares, purchase_price, purchase_date, notes, last_updated)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-            """, (symbol, 0, request.entry_price, __import__('datetime').date.today().isoformat(),
-                  f"Signal: {request.signal} | SL: {request.stop_loss} | TP: {request.target_price} | Source: {request.source} | Tier: {request.tier}"))
-        else:
-            cursor.execute("""
-                INSERT INTO portfolio (symbol, shares, purchase_price, purchase_date, notes, last_updated)
-                VALUES (?, ?, ?, ?, ?, datetime('now'))
-            """, (symbol, 0, request.entry_price, __import__('datetime').date.today().isoformat(),
-                  f"Signal: {request.signal} | SL: {request.stop_loss} | TP: {request.target_price} | Source: {request.source} | Tier: {request.tier}"))
-        conn.commit()
-        conn.close()
-        return {"message": f"Added {symbol} from daily report", "ticker": symbol, "signal": request.signal}
+        row_id = db.add_portfolio_position(
+            symbol=symbol,
+            shares=request.shares,
+            purchase_price=request.entry_price,
+            notes=f"From daily report | Signal: {request.signal}",
+            tier=request.tier,
+            stop_loss=request.stop_loss,
+            target_price=request.target_price,
+            signal=request.signal,
+            source=request.source,
+        )
+        return {"message": f"Added {symbol} from daily report", "id": row_id, "ticker": symbol, "signal": request.signal}
     except HTTPException:
         raise
     except Exception as e:

@@ -96,7 +96,20 @@ class DatabaseManager:
                     id SERIAL PRIMARY KEY,
                     symbol TEXT NOT NULL, shares REAL,
                     purchase_price REAL, purchase_date DATE,
-                    current_price REAL, last_updated TIMESTAMP, notes TEXT
+                    current_price REAL, last_updated TIMESTAMP, notes TEXT,
+                    tier TEXT DEFAULT 'midcap_active',
+                    status TEXT DEFAULT 'active',
+                    stop_loss REAL,
+                    target_price REAL,
+                    signal TEXT,
+                    source TEXT DEFAULT 'manual',
+                    current_score INTEGER,
+                    last_scored_at TIMESTAMP,
+                    total_invested REAL,
+                    unrealized_pnl REAL,
+                    unrealized_pnl_pct REAL,
+                    health TEXT DEFAULT 'healthy',
+                    alert TEXT
                 )
             """)
             cursor.execute("""
@@ -228,7 +241,20 @@ class DatabaseManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL, shares REAL,
                     purchase_price REAL, purchase_date DATE,
-                    current_price REAL, last_updated DATETIME, notes TEXT
+                    current_price REAL, last_updated DATETIME, notes TEXT,
+                    tier TEXT DEFAULT 'midcap_active',
+                    status TEXT DEFAULT 'active',
+                    stop_loss REAL,
+                    target_price REAL,
+                    signal TEXT,
+                    source TEXT DEFAULT 'manual',
+                    current_score INTEGER,
+                    last_scored_at TIMESTAMP,
+                    total_invested REAL,
+                    unrealized_pnl REAL,
+                    unrealized_pnl_pct REAL,
+                    health TEXT DEFAULT 'healthy',
+                    alert TEXT
                 )
             """)
             cursor.execute("""
@@ -312,7 +338,38 @@ class DatabaseManager:
 
         conn.commit()
         conn.close()
+
+        # Safe ALTER — add new portfolio columns if they don't exist
+        self._migrate_portfolio_table()
+
         print("✅ Database initialized successfully!")
+
+    def _migrate_portfolio_table(self):
+        """Add new portfolio columns if they don't exist (safe for re-runs)."""
+        new_columns = [
+            ("tier", "TEXT DEFAULT 'midcap_active'"),
+            ("status", "TEXT DEFAULT 'active'"),
+            ("stop_loss", "REAL"),
+            ("target_price", "REAL"),
+            ("signal", "TEXT"),
+            ("source", "TEXT DEFAULT 'manual'"),
+            ("current_score", "INTEGER"),
+            ("last_scored_at", "TIMESTAMP" if DB_TYPE == "postgres" else "DATETIME"),
+            ("total_invested", "REAL"),
+            ("unrealized_pnl", "REAL"),
+            ("unrealized_pnl_pct", "REAL"),
+            ("health", "TEXT DEFAULT 'healthy'"),
+            ("alert", "TEXT"),
+        ]
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        for col_name, col_type in new_columns:
+            try:
+                cursor.execute(f"ALTER TABLE portfolio ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass  # Column already exists
+        conn.commit()
+        conn.close()
 
     # ========== STOCK PRICE OPERATIONS ==========
 
@@ -416,15 +473,22 @@ class DatabaseManager:
 
     # ========== PORTFOLIO OPERATIONS ==========
 
-    def add_portfolio_position(self, symbol, shares, purchase_price, purchase_date=None, notes=""):
+    def add_portfolio_position(self, symbol, shares, purchase_price, purchase_date=None,
+                                notes="", tier="midcap_active", stop_loss=None,
+                                target_price=None, signal=None, source="manual"):
         conn = self.get_connection()
         cursor = conn.cursor()
         if purchase_date is None:
             purchase_date = datetime.now().date()
+        total_invested = shares * purchase_price if shares and purchase_price else 0
         cursor.execute(f"""
-            INSERT INTO portfolio (symbol, shares, purchase_price, purchase_date, last_updated, notes)
-            VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH})
-        """, (symbol.upper(), shares, purchase_price, purchase_date, datetime.now(), notes))
+            INSERT INTO portfolio (symbol, shares, purchase_price, purchase_date,
+                                   last_updated, notes, tier, status, stop_loss,
+                                   target_price, signal, source, total_invested, health)
+            VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})
+        """, (symbol.upper(), shares, purchase_price, purchase_date,
+              datetime.now(), notes, tier, 'active', stop_loss,
+              target_price, signal, source, total_invested, 'healthy'))
         conn.commit()
         row_id = cursor.lastrowid if DB_TYPE == "sqlite" else None
         if DB_TYPE == "postgres":
@@ -438,6 +502,79 @@ class DatabaseManager:
         df = pd.read_sql_query("SELECT * FROM portfolio ORDER BY symbol", conn)
         conn.close()
         return df
+
+    def get_active_positions(self):
+        """Return all active portfolio positions as list of dicts."""
+        conn = self.get_connection()
+        if DB_TYPE == "postgres":
+            import psycopg2.extras
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        else:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM portfolio WHERE status = {PH} ORDER BY tier, symbol", ('active',))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def update_position_score(self, position_id, current_price, composite_score,
+                               unrealized_pnl, unrealized_pnl_pct, health, alert):
+        """Update a position with latest scoring data."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            UPDATE portfolio SET
+                current_price = {PH}, current_score = {PH}, last_scored_at = {PH},
+                unrealized_pnl = {PH}, unrealized_pnl_pct = {PH},
+                health = {PH}, alert = {PH}, last_updated = {PH}
+            WHERE id = {PH}
+        """, (current_price, composite_score, datetime.now(),
+              unrealized_pnl, unrealized_pnl_pct, health, alert,
+              datetime.now(), position_id))
+        conn.commit()
+        conn.close()
+
+    def update_position(self, position_id, **kwargs):
+        """Update arbitrary fields on a portfolio position."""
+        if not kwargs:
+            return
+        set_parts = []
+        values = []
+        for key, val in kwargs.items():
+            set_parts.append(f"{key} = {PH}")
+            values.append(val)
+        values.append(position_id)
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE portfolio SET {', '.join(set_parts)} WHERE id = {PH}", tuple(values))
+        conn.commit()
+        conn.close()
+
+    def close_position(self, position_id):
+        """Mark a position as closed (soft delete)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE portfolio SET status = {PH}, last_updated = {PH} WHERE id = {PH}",
+                       ('closed', datetime.now(), position_id))
+        conn.commit()
+        affected = cursor.rowcount
+        conn.close()
+        return affected > 0
+
+    def get_positions_with_alerts(self):
+        """Return positions that have active alerts."""
+        conn = self.get_connection()
+        if DB_TYPE == "postgres":
+            import psycopg2.extras
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        else:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM portfolio WHERE status = {PH} AND alert IS NOT NULL AND alert != '' ORDER BY health DESC, symbol",
+                       ('active',))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
 
     def delete_portfolio_position(self, position_id):
         conn = self.get_connection()
