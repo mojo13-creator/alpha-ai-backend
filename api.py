@@ -733,6 +733,455 @@ async def dismiss_pending_import(import_id: int):
     return {"message": "Dismissed"}
 
 
+# ========== NEWS INTELLIGENCE ENDPOINT ==========
+import uuid
+import json
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
+
+# Cache timestamp for news intelligence
+_news_cache_time = None
+_news_cache_data = None
+
+def _similarity(a: str, b: str) -> float:
+    """Quick headline similarity check for deduplication."""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def _source_credibility(source: str, source_type: str) -> int:
+    """Score source credibility 0-100."""
+    major = {"reuters", "bloomberg", "financial times", "wall street journal",
+             "wsj", "cnbc", "associated press", "ap", "new york times", "nyt",
+             "barron's", "marketwatch", "the economist"}
+    mid = {"business insider", "yahoo finance", "investopedia", "seeking alpha",
+           "motley fool", "benzinga", "thestreet"}
+    src_lower = source.lower()
+    if any(m in src_lower for m in major):
+        return 90
+    if any(m in src_lower for m in mid):
+        return 65
+    if source_type == "reddit":
+        return 35
+    if source_type == "finviz":
+        return 55
+    return 45
+
+def _compute_importance(article: dict) -> int:
+    """Compute importance score 0-100 for a raw article before AI analysis."""
+    score = 50
+    # Source credibility
+    cred = _source_credibility(article.get("source", ""), article.get("source_type", ""))
+    score = int(cred * 0.5)  # base from credibility
+
+    # Recency bonus
+    published = article.get("published_at", "")
+    if published:
+        try:
+            if isinstance(published, str):
+                pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+            else:
+                pub_dt = published
+            age_hours = (datetime.now(pub_dt.tzinfo) if pub_dt.tzinfo else datetime.now() - pub_dt).total_seconds() / 3600
+        except Exception:
+            age_hours = 24
+        if hasattr(age_hours, '__float__'):
+            pass
+        else:
+            try:
+                age_td = datetime.now() - pub_dt.replace(tzinfo=None)
+                age_hours = age_td.total_seconds() / 3600
+            except Exception:
+                age_hours = 24
+        if age_hours < 1:
+            score += 25
+        elif age_hours < 6:
+            score += 15
+        elif age_hours < 24:
+            score += 5
+
+    return min(score, 100)
+
+def _deduplicate_articles(articles: list) -> list:
+    """Remove near-duplicate headlines, keeping the one from the best source."""
+    if not articles:
+        return []
+    seen = []
+    for article in articles:
+        headline = article.get("headline", "")
+        is_dup = False
+        for i, existing in enumerate(seen):
+            if _similarity(headline, existing["headline"]) > 0.7:
+                # Merge source tags
+                existing_tags = set(existing.get("source_tags", []))
+                new_tags = set(article.get("source_tags", []))
+                existing["source_tags"] = list(existing_tags | new_tags)
+                # Keep higher credibility version
+                if _source_credibility(article.get("source", ""), article.get("source_type", "")) > \
+                   _source_credibility(existing.get("source", ""), existing.get("source_type", "")):
+                    article["source_tags"] = existing["source_tags"]
+                    seen[i] = article
+                is_dup = True
+                break
+        if not is_dup:
+            seen.append(article)
+    return seen
+
+def _collect_all_news() -> list:
+    """Aggregate news from all sources into a unified list."""
+    raw_articles = []
+
+    # 1. NewsAPI — general market news
+    try:
+        news_items = news_scraper.fetch_general_market_news(days=1)
+        for item in news_items:
+            if item.get("source") == "Mock":
+                continue
+            raw_articles.append({
+                "id": str(uuid.uuid4()),
+                "headline": item.get("title", ""),
+                "source": item.get("source", "Unknown"),
+                "source_type": "major_outlet",
+                "url": item.get("url", ""),
+                "published_at": item.get("published_at", ""),
+                "description": item.get("description", ""),
+                "source_tags": ["newsapi"],
+            })
+    except Exception as e:
+        print(f"⚠️  NewsAPI collection error: {e}")
+
+    # 2. Reddit — scrape stock subreddits
+    try:
+        reddit_scraper_instance = RedditScraper(db)
+        if reddit_scraper_instance.reddit is not None:
+            for sub in ["wallstreetbets", "stocks", "investing", "stockmarket"]:
+                try:
+                    posts = reddit_scraper_instance.scrape_subreddit(sub, limit=15)
+                    for post in posts:
+                        raw_articles.append({
+                            "id": str(uuid.uuid4()),
+                            "headline": post.get("title", ""),
+                            "source": f"r/{post.get('subreddit', sub)}",
+                            "source_type": "reddit",
+                            "url": post.get("url", ""),
+                            "published_at": post.get("created_utc", datetime.now()).isoformat() if isinstance(post.get("created_utc"), datetime) else str(post.get("created_utc", "")),
+                            "description": (post.get("selftext", "") or "")[:300],
+                            "source_tags": ["reddit"],
+                        })
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"⚠️  Reddit collection error: {e}")
+
+    # 3. Finviz — top signals as news-like items
+    try:
+        finviz_results = finviz.get_all_signals()
+        for stock in finviz_results[:30]:
+            raw_articles.append({
+                "id": str(uuid.uuid4()),
+                "headline": f"{stock.get('symbol', '')} ({stock.get('company', '')}) — {stock.get('signal', 'Signal')} | {stock.get('sector', '')}",
+                "source": "Finviz Screener",
+                "source_type": "finviz",
+                "url": f"https://finviz.com/quote.ashx?t={stock.get('symbol', '')}",
+                "published_at": datetime.now().isoformat(),
+                "description": f"Price: ${stock.get('price', 0)}, Change: {stock.get('change_pct', 0)}%, Volume: {stock.get('volume', 0)}, Market Cap: {stock.get('market_cap', '-')}",
+                "source_tags": ["finviz"],
+            })
+    except Exception as e:
+        print(f"⚠️  Finviz collection error: {e}")
+
+    return raw_articles
+
+def _ai_analyze_batch(articles: list) -> list:
+    """Send a batch of articles to Claude for financial analysis."""
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=os.environ.get("CLAUDE_API_KEY", ""))
+
+    # Build article summaries for the prompt
+    article_texts = []
+    for i, a in enumerate(articles):
+        article_texts.append(f"{i+1}. [{a.get('source', '')}] {a.get('headline', '')}\n   {a.get('description', '')[:200]}")
+
+    articles_block = "\n".join(article_texts)
+
+    prompt = f"""You are a financial news analyst. For each article below, determine:
+
+1. AFFECTED TICKER(S) — which specific stock(s) will be impacted. Be specific, not vague. If it's a macro story (Fed rates, tariffs), list the ETFs and sectors affected.
+2. DIRECTION — bullish or bearish for each ticker
+3. MAGNITUDE — low / medium / high impact
+4. SIGNAL — one of: STRONG_BUY, BUY, WATCH, IGNORE, SELL, SHORT
+5. TIME SENSITIVITY — is this actionable now, this week, or long-term?
+6. REASONING — 2-3 sentences max explaining the trade logic
+
+Be decisive. "WATCH" is acceptable for genuinely unclear situations, but don't default to it. If a story clearly helps or hurts a stock, say so.
+
+Articles:
+{articles_block}
+
+Respond in JSON array format only. Each element should have:
+- "article_index": (1-based index matching the article number above)
+- "affected_tickers": [{{"ticker": "XXX", "direction": "bullish|bearish", "signal": "STRONG_BUY|BUY|WATCH|IGNORE|SELL|SHORT"}}]
+- "magnitude": "low|medium|high"
+- "time_sensitivity": "actionable_now|this_week|long_term"
+- "reasoning": "string"
+
+No preamble. JSON array only."""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = response.content[0].text.strip()
+        # Parse JSON — handle potential markdown wrapping
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        analyses = json.loads(text)
+        return analyses
+    except Exception as e:
+        print(f"⚠️  AI analysis batch error: {e}")
+        return []
+
+def _build_intelligence_response(articles: list, ai_results: list) -> dict:
+    """Merge raw articles with AI analysis results into the final response."""
+    # Index AI results by article_index
+    ai_map = {}
+    for r in ai_results:
+        idx = r.get("article_index")
+        if idx is not None:
+            ai_map[idx] = r
+
+    enriched = []
+    all_tickers = set()
+    all_signals = set()
+    all_sources = set()
+    all_magnitudes = set()
+
+    for i, article in enumerate(articles):
+        ai = ai_map.get(i + 1, {})
+        affected = ai.get("affected_tickers", [])
+        magnitude = ai.get("magnitude", "low")
+        reasoning = ai.get("reasoning", "")
+        time_sensitivity = ai.get("time_sensitivity", "this_week")
+
+        # Compute final importance score
+        base_score = _compute_importance(article)
+        # Boost based on AI analysis
+        mag_boost = {"high": 25, "medium": 10, "low": 0}.get(magnitude, 0)
+        ticker_boost = min(len(affected) * 3, 15)
+        signal_boost = 0
+        for t in affected:
+            sig = t.get("signal", "WATCH")
+            if sig in ("STRONG_BUY", "SHORT"):
+                signal_boost = max(signal_boost, 15)
+            elif sig in ("BUY", "SELL"):
+                signal_boost = max(signal_boost, 8)
+        importance = min(base_score + mag_boost + ticker_boost + signal_boost, 100)
+
+        for t in affected:
+            all_tickers.add(t.get("ticker", ""))
+            all_signals.add(t.get("signal", ""))
+        all_sources.add(article.get("source", "").lower())
+        all_magnitudes.add(magnitude)
+
+        enriched_article = {
+            "id": article.get("id", str(uuid.uuid4())),
+            "headline": article.get("headline", ""),
+            "source": article.get("source", ""),
+            "source_type": article.get("source_type", ""),
+            "url": article.get("url", ""),
+            "published_at": article.get("published_at", ""),
+            "importance_score": importance,
+            "ai_analysis": {
+                "affected_tickers": affected,
+                "magnitude": magnitude,
+                "time_sensitivity": time_sensitivity,
+                "reasoning": reasoning,
+            },
+            "source_tags": article.get("source_tags", []),
+        }
+        enriched.append(enriched_article)
+
+        # Save to DB
+        try:
+            db.save_news_intelligence({
+                "id": enriched_article["id"],
+                "headline": enriched_article["headline"],
+                "source": enriched_article["source"],
+                "url": enriched_article["url"],
+                "published_at": enriched_article["published_at"],
+                "importance_score": importance,
+                "affected_tickers": json.dumps(affected),
+                "signals": json.dumps([t.get("signal") for t in affected]),
+                "magnitude": magnitude,
+                "reasoning": reasoning,
+            })
+        except Exception:
+            pass
+
+    # Sort by importance descending
+    enriched.sort(key=lambda x: x["importance_score"], reverse=True)
+
+    all_tickers.discard("")
+    all_signals.discard("")
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "article_count": len(enriched),
+        "articles": enriched,
+        "filters_available": {
+            "tickers": sorted(list(all_tickers)),
+            "signals": sorted(list(all_signals)),
+            "sources": sorted(list(all_sources)),
+            "magnitude": sorted(list(all_magnitudes)),
+        }
+    }
+
+@app.get("/api/news/intelligence")
+async def get_news_intelligence(ticker: str = "", signal: str = "", source: str = "", magnitude: str = "", refresh: bool = False):
+    """Multi-source news intelligence with AI analysis, cached for 15 minutes."""
+    global _news_cache_time, _news_cache_data
+
+    try:
+        # Check cache (15 minutes)
+        now = datetime.now()
+        if not refresh and _news_cache_data and _news_cache_time and (now - _news_cache_time).total_seconds() < 900:
+            data = _news_cache_data
+        else:
+            # Check DB cache first
+            cached_df = db.get_cached_news_intelligence(max_age_minutes=15)
+            if not refresh and cached_df is not None and not cached_df.empty and len(cached_df) >= 5:
+                # Rebuild response from DB cache
+                articles = []
+                all_tickers = set()
+                all_signals_set = set()
+                all_sources_set = set()
+                all_magnitudes_set = set()
+
+                for _, row in cached_df.iterrows():
+                    affected = []
+                    try:
+                        affected = json.loads(row.get("affected_tickers", "[]"))
+                    except Exception:
+                        pass
+                    sigs = []
+                    try:
+                        sigs = json.loads(row.get("signals", "[]"))
+                    except Exception:
+                        pass
+
+                    for t in affected:
+                        all_tickers.add(t.get("ticker", ""))
+                        all_signals_set.add(t.get("signal", ""))
+                    all_sources_set.add(str(row.get("source", "")).lower())
+                    all_magnitudes_set.add(str(row.get("magnitude", "")))
+
+                    articles.append({
+                        "id": str(row.get("id", "")),
+                        "headline": str(row.get("headline", "")),
+                        "source": str(row.get("source", "")),
+                        "source_type": "",
+                        "url": str(row.get("url", "")),
+                        "published_at": str(row.get("published_at", "")),
+                        "importance_score": int(row.get("importance_score", 0)),
+                        "ai_analysis": {
+                            "affected_tickers": affected,
+                            "magnitude": str(row.get("magnitude", "")),
+                            "time_sensitivity": "this_week",
+                            "reasoning": str(row.get("reasoning", "")),
+                        },
+                        "source_tags": [],
+                    })
+
+                all_tickers.discard("")
+                all_signals_set.discard("")
+                articles.sort(key=lambda x: x["importance_score"], reverse=True)
+
+                data = {
+                    "generated_at": datetime.now().isoformat(),
+                    "article_count": len(articles),
+                    "articles": articles,
+                    "filters_available": {
+                        "tickers": sorted(list(all_tickers)),
+                        "signals": sorted(list(all_signals_set)),
+                        "sources": sorted(list(all_sources_set)),
+                        "magnitude": sorted(list(all_magnitudes_set)),
+                    }
+                }
+            else:
+                # Fresh fetch: collect, deduplicate, AI analyze
+                print("📰 Collecting news from all sources...")
+                raw = _collect_all_news()
+                print(f"   Raw articles: {len(raw)}")
+
+                # Deduplicate
+                deduped = _deduplicate_articles(raw)
+                print(f"   After dedup: {len(deduped)}")
+
+                # Limit to top ~40 for AI analysis (cost control)
+                deduped = deduped[:40]
+
+                # AI analyze in batches of 8
+                all_ai_results = []
+                batch_size = 8
+                for batch_start in range(0, len(deduped), batch_size):
+                    batch = deduped[batch_start:batch_start + batch_size]
+                    # Adjust article indices for this batch
+                    results = _ai_analyze_batch(batch)
+                    # Re-index to global position
+                    for r in results:
+                        r["article_index"] = r.get("article_index", 0) + batch_start
+                    all_ai_results.extend(results)
+
+                # Build final response
+                data = _build_intelligence_response(deduped, all_ai_results)
+
+                # Clean old entries
+                try:
+                    db.clear_old_news_intelligence(hours=48)
+                except Exception:
+                    pass
+
+            # Update in-memory cache
+            _news_cache_time = now
+            _news_cache_data = data
+
+        # Apply filters
+        articles = data["articles"]
+        if ticker:
+            ticker_upper = ticker.upper()
+            articles = [a for a in articles if any(
+                t.get("ticker", "").upper() == ticker_upper
+                for t in a.get("ai_analysis", {}).get("affected_tickers", [])
+            )]
+        if signal:
+            signal_upper = signal.upper()
+            articles = [a for a in articles if any(
+                t.get("signal", "").upper() == signal_upper
+                for t in a.get("ai_analysis", {}).get("affected_tickers", [])
+            )]
+        if source:
+            source_lower = source.lower()
+            articles = [a for a in articles if source_lower in a.get("source", "").lower()]
+        if magnitude:
+            mag_lower = magnitude.lower()
+            articles = [a for a in articles if a.get("ai_analysis", {}).get("magnitude", "").lower() == mag_lower]
+
+        return {
+            "generated_at": data["generated_at"],
+            "article_count": len(articles),
+            "articles": articles,
+            "filters_available": data["filters_available"],
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ========== BERKELEY ENRICHMENT ENDPOINT ==========
 from data_collection.berkeley.enrichment_manager import BerkeleyEnrichmentManager
 

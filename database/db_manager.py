@@ -152,6 +152,21 @@ class DatabaseManager:
                     raw_response TEXT
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS news_intelligence (
+                    id TEXT PRIMARY KEY,
+                    headline TEXT,
+                    source TEXT,
+                    url TEXT,
+                    published_at TIMESTAMP,
+                    importance_score INTEGER,
+                    affected_tickers TEXT,
+                    signals TEXT,
+                    magnitude TEXT,
+                    reasoning TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS stock_prices (
@@ -257,6 +272,21 @@ class DatabaseManager:
                     weight_profile TEXT,
                     market_cap_category TEXT,
                     raw_response TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS news_intelligence (
+                    id TEXT PRIMARY KEY,
+                    headline TEXT,
+                    source TEXT,
+                    url TEXT,
+                    published_at DATETIME,
+                    importance_score INTEGER,
+                    affected_tickers TEXT,
+                    signals TEXT,
+                    magnitude TEXT,
+                    reasoning TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -622,3 +652,66 @@ class DatabaseManager:
         df = pd.read_sql_query(query, conn, params=(ticker.upper(),))
         conn.close()
         return df
+
+    # ========== NEWS INTELLIGENCE OPERATIONS ==========
+
+    def save_news_intelligence(self, article):
+        """Save a single news intelligence article (dict with id, headline, etc.)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            if DB_TYPE == "postgres":
+                cursor.execute("""
+                    INSERT INTO news_intelligence
+                    (id, headline, source, url, published_at, importance_score,
+                     affected_tickers, signals, magnitude, reasoning)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        importance_score=EXCLUDED.importance_score,
+                        affected_tickers=EXCLUDED.affected_tickers,
+                        signals=EXCLUDED.signals,
+                        reasoning=EXCLUDED.reasoning
+                """, (article["id"], article["headline"], article["source"],
+                      article["url"], article["published_at"],
+                      article["importance_score"], article["affected_tickers"],
+                      article["signals"], article["magnitude"], article["reasoning"]))
+            else:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO news_intelligence
+                    (id, headline, source, url, published_at, importance_score,
+                     affected_tickers, signals, magnitude, reasoning)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                """, (article["id"], article["headline"], article["source"],
+                      article["url"], article["published_at"],
+                      article["importance_score"], article["affected_tickers"],
+                      article["signals"], article["magnitude"], article["reasoning"]))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"⚠️  Error saving news intelligence: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def get_cached_news_intelligence(self, max_age_minutes=15):
+        """Return cached news if fresh enough, else empty DataFrame."""
+        conn = self.get_connection()
+        if DB_TYPE == "postgres":
+            age_check = f"created_at >= NOW() - INTERVAL '{max_age_minutes} minutes'"
+        else:
+            age_check = f"created_at >= datetime('now', '-{max_age_minutes} minutes')"
+        query = f"SELECT * FROM news_intelligence WHERE {age_check} ORDER BY importance_score DESC"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+
+    def clear_old_news_intelligence(self, hours=24):
+        """Remove news intelligence older than N hours."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if DB_TYPE == "postgres":
+            cursor.execute(f"DELETE FROM news_intelligence WHERE created_at < NOW() - INTERVAL '{hours} hours'")
+        else:
+            cursor.execute(f"DELETE FROM news_intelligence WHERE created_at < datetime('now', '-{hours} hours')")
+        conn.commit()
+        conn.close()
