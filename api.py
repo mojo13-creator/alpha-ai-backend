@@ -341,6 +341,48 @@ async def delete_position(position_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ReportPickPortfolioRequest(BaseModel):
+    ticker: str
+    entry_price: float
+    stop_loss: float
+    target_price: float
+    signal: str
+    source: str = "daily_report"
+    tier: str = "midcap_active"
+
+@app.post("/api/portfolio/from-report")
+async def add_report_pick_to_portfolio(request: ReportPickPortfolioRequest):
+    """Add a daily report pick to the portfolio tracking table."""
+    try:
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        symbol = request.ticker.upper().strip()
+        if not symbol.isalpha() or len(symbol) > 10:
+            raise HTTPException(status_code=400, detail="Invalid ticker symbol")
+
+        if os.environ.get("DATABASE_URL"):
+            cursor.execute("""
+                INSERT INTO portfolio (symbol, shares, purchase_price, purchase_date, notes, last_updated)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+            """, (symbol, 0, request.entry_price, __import__('datetime').date.today().isoformat(),
+                  f"Signal: {request.signal} | SL: {request.stop_loss} | TP: {request.target_price} | Source: {request.source} | Tier: {request.tier}"))
+        else:
+            cursor.execute("""
+                INSERT INTO portfolio (symbol, shares, purchase_price, purchase_date, notes, last_updated)
+                VALUES (?, ?, ?, ?, ?, datetime('now'))
+            """, (symbol, 0, request.entry_price, __import__('datetime').date.today().isoformat(),
+                  f"Signal: {request.signal} | SL: {request.stop_loss} | TP: {request.target_price} | Source: {request.source} | Tier: {request.tier}"))
+        conn.commit()
+        conn.close()
+        return {"message": f"Added {symbol} from daily report", "ticker": symbol, "signal": request.signal}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/portfolio/history")
 async def get_portfolio_history():
     try:
@@ -557,14 +599,31 @@ async def get_alerts():
 
 # ========== REPORTS ENDPOINTS ==========
 from reports.report_generator import ReportGenerator
+from reports.report_scheduler import ReportScheduler
 
 report_generator = ReportGenerator(db, analyzer, recommender, news_scraper)
+daily_report_scheduler = ReportScheduler(db, analyzer, news_scraper)
 
 @app.get("/api/reports/daily")
-async def get_daily_report():
+async def get_daily_report(force: bool = False, date: str = ""):
+    """
+    Structured daily report with AI-scored picks.
+    Returns cached report if available, generates fresh if not.
+    ?force=true to regenerate. ?date=YYYY-MM-DD for historical.
+    """
     try:
-        report = report_generator.generate_daily_report()
-        return {"type": "daily", "report": report, "generated_at": __import__('datetime').datetime.now().isoformat()}
+        target_date = date if date else None
+
+        if not force:
+            cached = daily_report_scheduler.get_cached_report(report_date=target_date)
+            if cached:
+                return cached
+
+        if target_date:
+            raise HTTPException(status_code=404, detail=f"No report found for {target_date}")
+
+        report = daily_report_scheduler.generate_daily_report()
+        return report
     except Exception as e:
         import traceback
         traceback.print_exc()

@@ -167,6 +167,16 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS daily_reports (
+                    id SERIAL PRIMARY KEY,
+                    report_date DATE UNIQUE NOT NULL,
+                    generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    market_summary TEXT,
+                    picks_json TEXT,
+                    watchlist_json TEXT
+                )
+            """)
         else:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS stock_prices (
@@ -287,6 +297,16 @@ class DatabaseManager:
                     magnitude TEXT,
                     reasoning TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS daily_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_date DATE UNIQUE NOT NULL,
+                    generated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    market_summary TEXT,
+                    picks_json TEXT,
+                    watchlist_json TEXT
                 )
             """)
 
