@@ -88,3 +88,4 @@ python-dotenv
 slowapi
 playwright
 wrds
+google-genai

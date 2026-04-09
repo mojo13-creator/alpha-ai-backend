@@ -217,6 +217,9 @@ CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 if not CLAUDE_API_KEY:
     raise ValueError("CLAUDE_API_KEY not set — add it to your .env file")
 
+# Gemini API Key (for dual-AI opinion in composite scorer)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
 # Enable/Disable AI Analysis
 # Set to False to use traditional technical analysis
 # Set to True to use Claude AI for advanced analysis

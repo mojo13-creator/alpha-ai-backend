@@ -16,6 +16,7 @@ from analysis.technical_scorer import calculate_technical_score
 from analysis.fundamental_scorer import calculate_fundamental_score, classify_market_cap
 from analysis.sentiment_scorer import calculate_sentiment_score
 from analysis.ai_analyzer import AIStockAnalyzer
+from analysis.gemini_analyzer import GeminiAnalyzer
 
 
 def safe_float(val, default=0.0):
@@ -155,6 +156,66 @@ def calculate_action(signal, price, atr, df=None):
     }
 
 
+def _signal_direction(signal):
+    """Map a signal string to bullish/bearish/neutral."""
+    if not signal:
+        return 'neutral'
+    s = signal.upper().replace('_', ' ').strip()
+    if s in ('STRONG BUY', 'BUY', 'STRONG_BUY'):
+        return 'bullish'
+    if s in ('STRONG SELL', 'SELL', 'SHORT', 'STRONG_SELL'):
+        return 'bearish'
+    return 'neutral'
+
+
+def _build_multi_model(claude_result, gemini_result):
+    """
+    Compare Claude and Gemini results. Returns a multi_model dict or None.
+    """
+    if not claude_result or not gemini_result:
+        return None
+
+    c_score = claude_result['score']
+    g_score = gemini_result['score']
+    spread = abs(c_score - g_score)
+
+    c_dir = _signal_direction(claude_result.get('action') or claude_result.get('signal', ''))
+    g_dir = _signal_direction(gemini_result.get('signal', ''))
+
+    same_direction = (c_dir == g_dir)
+
+    if spread <= 15 and same_direction:
+        consensus = 'AGREE'
+        confidence = 'HIGH'
+        note = 'Both models bullish with similar targets' if c_dir == 'bullish' else \
+               'Both models bearish with similar outlook' if c_dir == 'bearish' else \
+               'Both models neutral'
+    elif spread <= 30 and same_direction:
+        consensus = 'PARTIAL'
+        confidence = 'MODERATE'
+        note = f'Same direction but {spread}-point spread — models weight factors differently'
+    elif spread > 30 or not same_direction:
+        consensus = 'DISAGREE'
+        confidence = 'LOW'
+        reasons = []
+        if not same_direction:
+            reasons.append(f'Claude says {c_dir}, Gemini says {g_dir}')
+        if spread > 30:
+            reasons.append(f'{spread}-point score gap')
+        note = ' and '.join(reasons) + ' — investigate both perspectives'
+    else:
+        consensus = 'PARTIAL'
+        confidence = 'MODERATE'
+        note = f'{spread}-point spread with differing emphasis'
+
+    return {
+        'consensus': consensus,
+        'confidence': confidence,
+        'agreement_note': note,
+        'score_spread': spread,
+    }
+
+
 def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
                             reddit_scraper=None, finviz_data=None, skip_ai=False,
                             use_berkeley=True):
@@ -262,8 +323,23 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
     )
     print(f"  Sentiment Score: {sent_result['score']}/100")
 
-    # 6. AI Insight Score
+    # 6. AI Insight Score (dual-model: Claude + Gemini)
     print(f"\n🤖 Phase 4: AI Insight Analysis...")
+    claude_result = None
+    gemini_result = None
+
+    ai_kwargs = dict(
+        symbol=symbol,
+        price=price,
+        stock_info=stock_info,
+        technical_result=tech_result,
+        fundamental_result=fund_result,
+        sentiment_result=sent_result,
+        news_headlines=news_articles[:8],
+        df=df,
+        berkeley_data=berkeley_data or None,
+    )
+
     if skip_ai:
         ai_result = {
             'score': 50, 'reasoning': 'AI analysis skipped',
@@ -273,19 +349,37 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         }
         print(f"  AI Insight Score: SKIPPED")
     else:
+        # --- Claude ---
+        print(f"  Running Claude analysis...")
         ai_analyzer = AIStockAnalyzer(db_manager, technical_analyzer, news_scraper)
-        ai_result = ai_analyzer.get_ai_insight_score(
-            symbol=symbol,
-            price=price,
-            stock_info=stock_info,
-            technical_result=tech_result,
-            fundamental_result=fund_result,
-            sentiment_result=sent_result,
-            news_headlines=news_articles[:8],
-            df=df,
-            berkeley_data=berkeley_data or None,
-        )
-        print(f"  AI Insight Score: {ai_result['score']}/100")
+        claude_result = ai_analyzer.get_ai_insight_score(**ai_kwargs)
+        print(f"  Claude Score: {claude_result['score']}/100")
+
+        # --- Gemini ---
+        print(f"  Running Gemini analysis...")
+        try:
+            gemini_analyzer = GeminiAnalyzer()
+            gemini_result = gemini_analyzer.get_gemini_insight_score(**ai_kwargs)
+            if gemini_result:
+                print(f"  Gemini Score: {gemini_result['score']}/100")
+            else:
+                print(f"  Gemini: unavailable")
+        except Exception as e:
+            print(f"  ⚠️  Gemini failed: {e}")
+
+        # --- Combine scores ---
+        if gemini_result:
+            avg_score = round((claude_result['score'] + gemini_result['score']) / 2)
+            ai_result = dict(claude_result)  # start from Claude's result
+            ai_result['score'] = avg_score
+        else:
+            ai_result = claude_result
+
+    # --- Build multi_model consensus ---
+    multi_model = _build_multi_model(claude_result, gemini_result)
+    if multi_model:
+        print(f"  Consensus: {multi_model['consensus']} (spread: {multi_model['score_spread']})")
+    print(f"  AI Insight Score (combined): {ai_result['score']}/100")
 
     # 7. Composite Score with market-cap weighting
     weights = WEIGHT_PROFILES.get(cap_cat, WEIGHT_PROFILES['unknown'])
@@ -444,6 +538,22 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
                 'agreements': ai_result.get('agreements', []),
                 'disagreements': ai_result.get('disagreements', []),
                 'risks': ai_result.get('risks', []),
+                'claude': {
+                    'score': claude_result['score'] if claude_result else ai_result['score'],
+                    'signal': (claude_result.get('action') or claude_result.get('signal', 'HOLD')) if claude_result else 'HOLD',
+                    'reasoning': claude_result.get('reasoning', '') if claude_result else '',
+                    'entry_price': claude_result.get('entry_price', 0) if claude_result else 0,
+                    'target_price': claude_result.get('target_price', 0) if claude_result else 0,
+                } if not skip_ai else None,
+                'gemini': {
+                    'score': gemini_result['score'],
+                    'signal': gemini_result.get('signal', 'HOLD'),
+                    'reasoning': gemini_result.get('reasoning', ''),
+                    'entry_price': gemini_result.get('entry_price', 0),
+                    'target_price': gemini_result.get('target_price', 0),
+                } if gemini_result else None,
+                'consensus': multi_model.get('consensus') if multi_model else None,
+                'agreement_note': multi_model.get('agreement_note', '') if multi_model else '',
             },
         },
         'action': action,
