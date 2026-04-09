@@ -190,6 +190,57 @@ class DatabaseManager:
                     watchlist_json TEXT
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trading_account (
+                    id SERIAL PRIMARY KEY,
+                    cash_balance REAL DEFAULT 10000.00,
+                    total_value REAL DEFAULT 10000.00,
+                    total_pnl REAL DEFAULT 0.00,
+                    total_pnl_pct REAL DEFAULT 0.00,
+                    total_trades INTEGER DEFAULT 0,
+                    winning_trades INTEGER DEFAULT 0,
+                    losing_trades INTEGER DEFAULT 0,
+                    win_rate REAL DEFAULT 0.00,
+                    last_algo_run TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_positions (
+                    id SERIAL PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    shares REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    current_price REAL,
+                    stop_loss REAL,
+                    target_price REAL,
+                    entry_signal TEXT,
+                    entry_score INTEGER,
+                    entry_reason TEXT,
+                    status TEXT DEFAULT 'open',
+                    exit_price REAL,
+                    exit_reason TEXT,
+                    pnl REAL,
+                    pnl_pct REAL,
+                    opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    closed_at TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trade_log (
+                    id SERIAL PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    shares REAL,
+                    price REAL,
+                    reason TEXT,
+                    score INTEGER,
+                    signal TEXT,
+                    cash_before REAL,
+                    cash_after REAL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         else:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS stock_prices (
@@ -333,6 +384,57 @@ class DatabaseManager:
                     market_summary TEXT,
                     picks_json TEXT,
                     watchlist_json TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trading_account (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cash_balance REAL DEFAULT 10000.00,
+                    total_value REAL DEFAULT 10000.00,
+                    total_pnl REAL DEFAULT 0.00,
+                    total_pnl_pct REAL DEFAULT 0.00,
+                    total_trades INTEGER DEFAULT 0,
+                    winning_trades INTEGER DEFAULT 0,
+                    losing_trades INTEGER DEFAULT 0,
+                    win_rate REAL DEFAULT 0.00,
+                    last_algo_run DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    shares REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    current_price REAL,
+                    stop_loss REAL,
+                    target_price REAL,
+                    entry_signal TEXT,
+                    entry_score INTEGER,
+                    entry_reason TEXT,
+                    status TEXT DEFAULT 'open',
+                    exit_price REAL,
+                    exit_reason TEXT,
+                    pnl REAL,
+                    pnl_pct REAL,
+                    opened_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    closed_at DATETIME
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trade_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    shares REAL,
+                    price REAL,
+                    reason TEXT,
+                    score INTEGER,
+                    signal TEXT,
+                    cash_before REAL,
+                    cash_after REAL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -870,5 +972,173 @@ class DatabaseManager:
             cursor.execute(f"DELETE FROM news_intelligence WHERE created_at < NOW() - INTERVAL '{hours} hours'")
         else:
             cursor.execute(f"DELETE FROM news_intelligence WHERE created_at < datetime('now', '-{hours} hours')")
+        conn.commit()
+        conn.close()
+
+    # ========== PAPER TRADING OPERATIONS ==========
+
+    def get_paper_account(self):
+        """Return the paper trading account row as a dict. Create if missing."""
+        conn = self.get_connection()
+        if DB_TYPE == "postgres":
+            import psycopg2.extras
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        else:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+        cursor.execute("SELECT * FROM paper_trading_account ORDER BY id LIMIT 1")
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return dict(row)
+        # First run — seed account with $10,000
+        cursor.execute(f"""
+            INSERT INTO paper_trading_account (cash_balance, total_value)
+            VALUES ({PH}, {PH})
+        """, (10000.0, 10000.0))
+        conn.commit()
+        cursor.execute("SELECT * FROM paper_trading_account ORDER BY id LIMIT 1")
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else {}
+
+    def update_paper_cash(self, new_cash):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE paper_trading_account SET cash_balance = {PH}", (new_cash,))
+        conn.commit()
+        conn.close()
+
+    def update_paper_account(self, **kwargs):
+        """Update arbitrary fields on the paper trading account."""
+        if not kwargs:
+            return
+        set_parts = []
+        values = []
+        for key, val in kwargs.items():
+            set_parts.append(f"{key} = {PH}")
+            values.append(val)
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE paper_trading_account SET {', '.join(set_parts)}", tuple(values))
+        conn.commit()
+        conn.close()
+
+    def create_paper_position(self, ticker, shares, entry_price, stop_loss,
+                               target_price, signal, score, reason):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            INSERT INTO paper_positions
+            (ticker, shares, entry_price, current_price, stop_loss, target_price,
+             entry_signal, entry_score, entry_reason, status)
+            VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})
+        """, (ticker.upper(), shares, entry_price, entry_price, stop_loss,
+              target_price, signal, score, reason, 'open'))
+        conn.commit()
+        row_id = cursor.lastrowid
+        conn.close()
+        return row_id
+
+    def get_open_paper_positions(self):
+        conn = self.get_connection()
+        if DB_TYPE == "postgres":
+            import psycopg2.extras
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        else:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM paper_positions WHERE status = {PH} ORDER BY opened_at", ('open',))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def get_all_paper_positions(self, limit=100):
+        conn = self.get_connection()
+        if DB_TYPE == "postgres":
+            import psycopg2.extras
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        else:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM paper_positions ORDER BY opened_at DESC LIMIT {limit}")
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def close_paper_position(self, position_id, exit_price, exit_reason, pnl, pnl_pct):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            UPDATE paper_positions SET
+                status = 'closed', exit_price = {PH}, exit_reason = {PH},
+                pnl = {PH}, pnl_pct = {PH}, closed_at = {PH}
+            WHERE id = {PH}
+        """, (exit_price, exit_reason, pnl, pnl_pct, datetime.now(), position_id))
+        conn.commit()
+        conn.close()
+
+    def update_paper_position_price(self, position_id, current_price):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE paper_positions SET current_price = {PH} WHERE id = {PH}",
+                       (current_price, position_id))
+        conn.commit()
+        conn.close()
+
+    def update_paper_stats(self, was_winner):
+        """Increment trade counts and recalculate win rate."""
+        account = self.get_paper_account()
+        total = account.get("total_trades", 0) + 1
+        wins = account.get("winning_trades", 0) + (1 if was_winner else 0)
+        losses = account.get("losing_trades", 0) + (0 if was_winner else 1)
+        win_rate = round((wins / total) * 100, 1) if total > 0 else 0
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            UPDATE paper_trading_account SET
+                total_trades = {PH}, winning_trades = {PH},
+                losing_trades = {PH}, win_rate = {PH}
+        """, (total, wins, losses, win_rate))
+        conn.commit()
+        conn.close()
+
+    def log_paper_trade(self, action, ticker, shares, price, reason,
+                         score, signal, cash_before, cash_after):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            INSERT INTO paper_trade_log
+            (action, ticker, shares, price, reason, score, signal, cash_before, cash_after)
+            VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})
+        """, (action, ticker.upper(), shares, price, reason, score, signal,
+              cash_before, cash_after))
+        conn.commit()
+        conn.close()
+
+    def get_paper_trade_log(self, limit=100):
+        conn = self.get_connection()
+        if DB_TYPE == "postgres":
+            import psycopg2.extras
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        else:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM paper_trade_log ORDER BY timestamp DESC LIMIT {limit}")
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def reset_paper_trading(self):
+        """Wipe all paper trading data and re-seed account with $10,000."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM paper_trade_log")
+        cursor.execute("DELETE FROM paper_positions")
+        cursor.execute("DELETE FROM paper_trading_account")
+        cursor.execute(f"""
+            INSERT INTO paper_trading_account (cash_balance, total_value)
+            VALUES ({PH}, {PH})
+        """, (10000.0, 10000.0))
         conn.commit()
         conn.close()

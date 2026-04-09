@@ -1400,3 +1400,108 @@ async def get_enrichment_data(ticker: str):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== PAPER TRADING ENDPOINTS ==========
+
+@app.get("/api/paper-trading/account")
+async def get_paper_trading_account():
+    """Returns paper trading account summary."""
+    try:
+        from trading.paper_trader import PaperTrader
+        trader = PaperTrader(db, analyzer, news_scraper)
+        summary = trader.get_summary()
+        return summary
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/paper-trading/positions")
+async def get_paper_trading_positions():
+    """Returns open paper trading positions with current prices."""
+    try:
+        import yfinance as yf
+        positions = db.get_open_paper_positions()
+        result = []
+        for pos in positions:
+            entry = safe_float(pos.get("entry_price", 0))
+            current = safe_float(pos.get("current_price", entry))
+            # Fetch live price
+            try:
+                t = yf.Ticker(pos["ticker"])
+                live_price = float(t.fast_info.last_price)
+                if live_price > 0:
+                    current = live_price
+                    db.update_paper_position_price(pos["id"], current)
+            except Exception:
+                pass
+            shares = safe_float(pos.get("shares", 0))
+            pnl = (current - entry) * shares
+            pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+            result.append({
+                "id": pos["id"],
+                "ticker": pos["ticker"],
+                "shares": round(shares, 4),
+                "entry_price": round(entry, 2),
+                "current_price": round(current, 2),
+                "market_value": round(shares * current, 2),
+                "stop_loss": round(safe_float(pos.get("stop_loss", 0)), 2),
+                "target_price": round(safe_float(pos.get("target_price", 0)), 2),
+                "unrealized_pnl": round(pnl, 2),
+                "unrealized_pnl_pct": round(pnl_pct, 2),
+                "signal": pos.get("entry_signal", ""),
+                "score": pos.get("entry_score"),
+                "reason": pos.get("entry_reason", ""),
+                "opened_at": str(pos.get("opened_at", "")),
+            })
+        return {"positions": result, "count": len(result)}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/paper-trading/history")
+async def get_paper_trading_history():
+    """Returns paper trade log (all buys and sells)."""
+    try:
+        log = db.get_paper_trade_log(limit=200)
+        return {"trades": log, "count": len(log)}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/paper-trading/run-algo")
+async def run_paper_trading_algo():
+    """Trigger the daily paper trading algorithm manually."""
+    try:
+        from trading.paper_trader import PaperTrader
+        trader = PaperTrader(db, analyzer, news_scraper)
+        result = trader.run_daily_algo()
+        return result
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/paper-trading/reset")
+async def reset_paper_trading():
+    """Reset paper trading account to $10,000 and clear all positions/history."""
+    try:
+        db.reset_paper_trading()
+        return {
+            "message": "Paper trading account reset to $10,000",
+            "cash_balance": 10000.00,
+            "total_value": 10000.00,
+            "positions": 0,
+            "trades": 0,
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
