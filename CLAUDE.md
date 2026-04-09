@@ -58,7 +58,8 @@ Read this file at the start of every session before touching any code.
 
 ### AI / Data
 - Claude Sonnet (`claude-sonnet-4-20250514`) — primary AI engine
-- Gemini API — planned (Feature 5, key not yet provided)
+- Gemini API (`gemini-2.5-flash`) — second AI opinion
+- OpenAI GPT-4o — third AI opinion (3-model consensus)
 - Perplexity API — planned (Feature 6, key not yet provided)
 - NewsAPI, Reddit public JSON, Finviz
 
@@ -78,6 +79,7 @@ stock-analyzer/
 │
 ├── analysis/
 │   ├── ai_analyzer.py              # Claude AI stock analysis engine
+│   ├── chatgpt_analyzer.py         # ChatGPT (GPT-4o) AI insight engine
 │   ├── ai.analyzer.py              # Legacy/duplicate — do not use for new work
 │   ├── hybrid_recommender.py       # Combines technical + AI signals
 │   ├── technical_analysis.py       # RSI, MACD, Bollinger Bands, SMA, etc.
@@ -159,7 +161,8 @@ from reports.report_generator import ReportGenerator
 | `NEWS_API_KEY` | NewsAPI key | Yes |
 | `FIDELITY_USERNAME` | Fidelity username | Future |
 | `FIDELITY_PASSWORD` | Fidelity password | Future |
-| `GEMINI_API_KEY` | Google Gemini key | Future (Feature 5) |
+| `GEMINI_API_KEY` | Google Gemini key | Yes |
+| `OPENAI_API_KEY` | OpenAI GPT-4o key | Yes |
 | `PERPLEXITY_API_KEY` | Perplexity key | Future (Feature 6) |
 
 ### How keys are loaded — always use this pattern:
@@ -175,6 +178,8 @@ if not api_key:
 ### Railway (production) env vars — set in Railway dashboard:
 - `CLAUDE_API_KEY`
 - `NEWS_API_KEY`
+- `GEMINI_API_KEY`
+- `OPENAI_API_KEY`
 - `DATABASE_URL` (set automatically by Railway PostgreSQL plugin)
 
 ---

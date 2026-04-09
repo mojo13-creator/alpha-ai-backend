@@ -89,3 +89,4 @@ slowapi
 playwright
 wrds
 google-genai
+openai

@@ -17,6 +17,7 @@ from analysis.fundamental_scorer import calculate_fundamental_score, classify_ma
 from analysis.sentiment_scorer import calculate_sentiment_score
 from analysis.ai_analyzer import AIStockAnalyzer
 from analysis.gemini_analyzer import GeminiAnalyzer
+from analysis.chatgpt_analyzer import ChatGPTAnalyzer
 
 
 def safe_float(val, default=0.0):
@@ -168,51 +169,85 @@ def _signal_direction(signal):
     return 'neutral'
 
 
-def _build_multi_model(claude_result, gemini_result):
+def _build_multi_model(claude_result, gemini_result, chatgpt_result=None):
     """
-    Compare Claude and Gemini results. Returns a multi_model dict or None.
+    Compare all available AI model results. Returns a multi_model dict or None.
+    Supports 2-model or 3-model consensus.
     """
-    if not claude_result or not gemini_result:
+    ai_opinions = {}
+    if claude_result:
+        ai_opinions['claude'] = claude_result
+    if gemini_result:
+        ai_opinions['gemini'] = gemini_result
+    if chatgpt_result:
+        ai_opinions['chatgpt'] = chatgpt_result
+
+    if len(ai_opinions) < 2:
         return None
 
-    c_score = claude_result['score']
-    g_score = gemini_result['score']
-    spread = abs(c_score - g_score)
+    scores = [v['score'] for v in ai_opinions.values()]
+    score_spread = max(scores) - min(scores)
 
-    c_dir = _signal_direction(claude_result.get('action') or claude_result.get('signal', ''))
-    g_dir = _signal_direction(gemini_result.get('signal', ''))
+    # Determine direction for each model
+    directions = {}
+    for name, result in ai_opinions.items():
+        sig = result.get('action') or result.get('signal', '')
+        directions[name] = _signal_direction(sig)
 
-    same_direction = (c_dir == g_dir)
+    signals = [result.get('action') or result.get('signal', 'HOLD') for result in ai_opinions.values()]
+    unique_signals = set(signals)
+    dir_values = list(directions.values())
+    all_same_direction = len(set(dir_values)) == 1
 
-    if spread <= 15 and same_direction:
-        consensus = 'AGREE'
-        confidence = 'HIGH'
-        note = 'Both models bullish with similar targets' if c_dir == 'bullish' else \
-               'Both models bearish with similar outlook' if c_dir == 'bearish' else \
-               'Both models neutral'
-    elif spread <= 30 and same_direction:
-        consensus = 'PARTIAL'
-        confidence = 'MODERATE'
-        note = f'Same direction but {spread}-point spread — models weight factors differently'
-    elif spread > 30 or not same_direction:
-        consensus = 'DISAGREE'
-        confidence = 'LOW'
-        reasons = []
-        if not same_direction:
-            reasons.append(f'Claude says {c_dir}, Gemini says {g_dir}')
-        if spread > 30:
-            reasons.append(f'{spread}-point score gap')
-        note = ' and '.join(reasons) + ' — investigate both perspectives'
+    # Consensus logic
+    if len(unique_signals) == 1:
+        consensus = 'UNANIMOUS'
+        consensus_confidence = 'VERY_HIGH'
+    elif all(s.upper().replace('_', '') in ('STRONGBUY', 'BUY') for s in signals) or \
+         all(s.upper().replace('_', '') in ('SELL', 'STRONGSELL', 'SHORT') for s in signals):
+        consensus = 'AGREE_DIRECTION'
+        consensus_confidence = 'HIGH'
+    elif score_spread <= 20:
+        consensus = 'CLOSE'
+        consensus_confidence = 'MODERATE'
     else:
-        consensus = 'PARTIAL'
-        confidence = 'MODERATE'
-        note = f'{spread}-point spread with differing emphasis'
+        consensus = 'DISAGREE'
+        consensus_confidence = 'LOW'
+
+    # Build agreement note
+    model_count = len(ai_opinions)
+    if consensus == 'UNANIMOUS':
+        common_dir = dir_values[0]
+        note = f'All {model_count} models {common_dir} with identical signals'
+    elif consensus == 'AGREE_DIRECTION':
+        common_dir = dir_values[0]
+        note = f'All {model_count} models {common_dir} (spread: {score_spread} pts)'
+    elif consensus == 'CLOSE':
+        note = f'{score_spread}-point spread across {model_count} models — similar conviction'
+    else:
+        # Build disagreement details
+        parts = []
+        for name, d in directions.items():
+            parts.append(f'{name.title()} says {d}')
+        note = ', '.join(parts) + f' (spread: {score_spread} pts)'
+
+    # Disagreements list: flag any model that disagrees with the majority direction
+    disagreements = []
+    if not all_same_direction:
+        from collections import Counter
+        dir_counts = Counter(dir_values)
+        majority_dir = dir_counts.most_common(1)[0][0]
+        for name, d in directions.items():
+            if d != majority_dir:
+                disagreements.append(f'{name.title()} is {d} while majority is {majority_dir}')
 
     return {
         'consensus': consensus,
-        'confidence': confidence,
+        'consensus_confidence': consensus_confidence,
         'agreement_note': note,
-        'score_spread': spread,
+        'score_spread': score_spread,
+        'models_used': model_count,
+        'disagreements': disagreements,
     }
 
 
@@ -323,10 +358,11 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
     )
     print(f"  Sentiment Score: {sent_result['score']}/100")
 
-    # 6. AI Insight Score (dual-model: Claude + Gemini)
+    # 6. AI Insight Score (tri-model: Claude + Gemini + ChatGPT)
     print(f"\n🤖 Phase 4: AI Insight Analysis...")
     claude_result = None
     gemini_result = None
+    chatgpt_result = None
 
     ai_kwargs = dict(
         symbol=symbol,
@@ -365,20 +401,34 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
             else:
                 print(f"  Gemini: unavailable")
         except Exception as e:
-            print(f"  ⚠️  Gemini failed: {e}")
+            print(f"  Gemini failed: {e}")
 
-        # --- Combine scores ---
+        # --- ChatGPT ---
+        print(f"  Running ChatGPT analysis...")
+        try:
+            chatgpt_analyzer = ChatGPTAnalyzer()
+            chatgpt_result = chatgpt_analyzer.get_chatgpt_insight_score(**ai_kwargs)
+            if chatgpt_result:
+                print(f"  ChatGPT Score: {chatgpt_result['score']}/100")
+            else:
+                print(f"  ChatGPT: unavailable")
+        except Exception as e:
+            print(f"  ChatGPT failed: {e}")
+
+        # --- Combine scores (average all available models) ---
+        ai_scores = [claude_result['score']]
         if gemini_result:
-            avg_score = round((claude_result['score'] + gemini_result['score']) / 2)
-            ai_result = dict(claude_result)  # start from Claude's result
-            ai_result['score'] = avg_score
-        else:
-            ai_result = claude_result
+            ai_scores.append(gemini_result['score'])
+        if chatgpt_result:
+            ai_scores.append(chatgpt_result['score'])
+        avg_score = round(sum(ai_scores) / len(ai_scores))
+        ai_result = dict(claude_result)  # start from Claude's result
+        ai_result['score'] = avg_score
 
     # --- Build multi_model consensus ---
-    multi_model = _build_multi_model(claude_result, gemini_result)
+    multi_model = _build_multi_model(claude_result, gemini_result, chatgpt_result)
     if multi_model:
-        print(f"  Consensus: {multi_model['consensus']} (spread: {multi_model['score_spread']})")
+        print(f"  Consensus: {multi_model['consensus']} ({multi_model.get('consensus_confidence', 'N/A')}, spread: {multi_model['score_spread']}, models: {multi_model.get('models_used', 0)})")
     print(f"  AI Insight Score (combined): {ai_result['score']}/100")
 
     # 7. Composite Score with market-cap weighting
@@ -398,8 +448,17 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         sent_result['score'], ai_result['score']
     )
 
-    # Confidence boost from Berkeley data breadth
+    # Confidence boost from AI consensus
     confidence_tiers = ['LOW', 'MODERATE', 'HIGH']
+    if multi_model and confidence in confidence_tiers:
+        mc = multi_model.get('consensus', '')
+        idx = confidence_tiers.index(confidence)
+        if mc in ('UNANIMOUS', 'AGREE_DIRECTION'):
+            confidence = confidence_tiers[min(idx + 1, 2)]
+        elif mc == 'DISAGREE':
+            confidence = confidence_tiers[max(idx - 1, 0)]
+
+    # Confidence boost from Berkeley data breadth
     num_berkeley = len(berkeley_sources_available)
     if num_berkeley >= 5 and confidence in confidence_tiers:
         idx = confidence_tiers.index(confidence)
@@ -534,6 +593,7 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
             },
             'ai_insight': {
                 'score': ai_result['score'],
+                'models_used': multi_model.get('models_used', 1) if multi_model else 1,
                 'reasoning': ai_result.get('reasoning', ''),
                 'agreements': ai_result.get('agreements', []),
                 'disagreements': ai_result.get('disagreements', []),
@@ -552,7 +612,16 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
                     'entry_price': gemini_result.get('entry_price', 0),
                     'target_price': gemini_result.get('target_price', 0),
                 } if gemini_result else None,
+                'chatgpt': {
+                    'score': chatgpt_result['score'],
+                    'signal': chatgpt_result.get('signal', 'HOLD'),
+                    'reasoning': chatgpt_result.get('reasoning', ''),
+                    'entry_price': chatgpt_result.get('entry_price', 0),
+                    'target_price': chatgpt_result.get('target_price', 0),
+                } if chatgpt_result else None,
                 'consensus': multi_model.get('consensus') if multi_model else None,
+                'consensus_confidence': multi_model.get('consensus_confidence') if multi_model else None,
+                'score_spread': multi_model.get('score_spread', 0) if multi_model else 0,
                 'agreement_note': multi_model.get('agreement_note', '') if multi_model else '',
             },
         },
