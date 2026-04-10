@@ -22,7 +22,7 @@ if not username or not password:
     print("FIDELITY_USERNAME and FIDELITY_PASSWORD must be set in .env")
     exit(1)
 
-print(f"Username: {username}")
+print(f"Username: {'*' * (len(username) - 2)}{username[-2:]}")
 print(f"TOTP secret: {'set' if totp_secret else 'not set'}")
 print("Opening Firefox browser for Fidelity login...")
 print()
@@ -63,7 +63,8 @@ if step_1 and step_2:
 
     if account_info:
         for acct_id, acct_data in account_info.items():
-            print(f"\nAccount: {acct_data.get('nickname', acct_id)} ({acct_id})")
+            masked_id = f"***{acct_id[-4:]}" if len(acct_id) > 4 else "****"
+            print(f"\nAccount: {acct_data.get('nickname', 'Unknown')} ({masked_id})")
             print(f"  Balance: ${acct_data.get('balance', 0):,.2f}")
             stocks = acct_data.get("stocks", [])
             for stock in stocks:

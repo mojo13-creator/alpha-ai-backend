@@ -83,14 +83,19 @@ class FidelityClient:
                 return {"status": "failed", "message": "Login failed — check credentials"}
 
         except Exception as e:
-            logger.error(f"Fidelity connection error: {e}")
+            # Sanitize error — never leak credentials in error messages
+            safe_msg = str(e)
+            for secret in (self.username, self.password, self.totp_secret):
+                if secret and secret in safe_msg:
+                    safe_msg = safe_msg.replace(secret, "***REDACTED***")
+            logger.error(f"Fidelity connection error: {safe_msg}")
             self.close()
-            return {"status": "failed", "message": str(e)}
+            return {"status": "failed", "message": safe_msg}
 
     def get_positions(self) -> list:
         """
         Pull all positions from Fidelity account.
-        Returns list of dicts with: ticker, shares, current_price, market_value, account_id.
+        Returns list of dicts with: ticker, shares, current_price, market_value, source.
         """
         if not self._logged_in:
             conn = self.connect()
@@ -124,7 +129,6 @@ class FidelityClient:
                         "shares": quantity,
                         "current_price": last_price,
                         "market_value": value,
-                        "account_id": account_id,
                         "source": "fidelity",
                     })
 
@@ -153,8 +157,10 @@ class FidelityClient:
 
             for account_id, account_data in account_dict.items():
                 balance = float(account_data.get("balance", 0))
+                # Mask account number — never expose full ID in API responses
+                masked_id = f"***{account_id[-4:]}" if len(account_id) > 4 else "****"
                 account = {
-                    "id": account_id,
+                    "id": masked_id,
                     "nickname": account_data.get("nickname", ""),
                     "balance": balance,
                     "withdrawal_balance": float(account_data.get("withdrawal_balance", 0)),
