@@ -113,8 +113,9 @@ class FidelityClient:
                 stocks = account_data.get("stocks", [])
                 for stock in stocks:
                     ticker = stock.get("ticker", "")
-                    # Skip cash positions (SPAXX, FDRXX, etc.)
-                    if not ticker or ticker in ("SPAXX", "FDRXX", "FCASH", "Pending Activity"):
+                    # Skip cash positions, money markets, and non-equity entries
+                    skip_prefixes = ("SPAXX", "FDRXX", "FCASH", "USD", "Pending")
+                    if not ticker or ticker.startswith(skip_prefixes) or "/" in ticker:
                         continue
 
                     quantity = float(stock.get("quantity", 0))
