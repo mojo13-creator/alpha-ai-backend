@@ -45,3 +45,8 @@ exports/
 browser_state/
 *.cookies
 playwright-state/
+
+# Fidelity session/state files
+fidelity_state/
+*.fidelity_session
+Fidelity_*.json

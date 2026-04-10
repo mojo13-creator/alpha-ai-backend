@@ -90,3 +90,5 @@ playwright
 wrds
 google-genai
 openai
+fidelity-api
+pyotp

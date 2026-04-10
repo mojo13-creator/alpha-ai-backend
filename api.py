@@ -1505,3 +1505,71 @@ async def reset_paper_trading():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== FIDELITY BROKERAGE SYNC ==========
+# NOTE: Fidelity sync is LOCAL EXECUTION ONLY — it runs a full Firefox browser
+# via Playwright to scrape Fidelity's website. Do NOT expect this to work on
+# Railway or any headless server without Firefox installed. Run locally only.
+from data_collection.fidelity_sync import FidelitySyncService
+
+fidelity_sync = FidelitySyncService(db)
+
+
+@app.post("/api/fidelity/sync")
+async def sync_fidelity(headless: bool = True):
+    """Sync Fidelity brokerage positions into Alpha AI portfolio (read-only). LOCAL ONLY.
+    Pass ?headless=false to open a visible browser for 2FA."""
+    import asyncio
+    try:
+        # Run in thread pool — fidelity-api uses sync Playwright which
+        # cannot run inside asyncio's event loop directly.
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: fidelity_sync.sync_positions(headless=headless))
+        if result["status"] == "2fa_required":
+            raise HTTPException(status_code=403, detail=result["message"])
+        if result["status"] == "failed":
+            raise HTTPException(status_code=502, detail=result.get("message", "Fidelity sync failed"))
+        if result["status"] == "no_credentials":
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/fidelity/status")
+async def fidelity_status():
+    """Check if Fidelity connection is active/possible. LOCAL ONLY."""
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, fidelity_sync.check_connection)
+        return result
+    except Exception as e:
+        return {"status": "error", "connected": False, "message": str(e)}
+
+
+@app.get("/api/fidelity/positions-raw")
+async def fidelity_positions_raw():
+    """Return raw Fidelity positions before sync (for preview). LOCAL ONLY."""
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, fidelity_sync.get_raw_positions)
+        if result["status"] == "2fa_required":
+            raise HTTPException(status_code=403, detail=result.get("message", "2FA required"))
+        if result["status"] == "failed":
+            raise HTTPException(status_code=502, detail=result.get("message", "Failed"))
+        if result["status"] == "no_credentials":
+            raise HTTPException(status_code=400, detail="Fidelity credentials not configured")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
