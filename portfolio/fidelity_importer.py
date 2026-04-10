@@ -51,22 +51,28 @@ class FidelityImporter:
                     
                     print(f"\n  Row {idx}: Ticker from Symbol column = '{ticker}'")
                     
-                    # Skip cash
-                    if any(skip in ticker for skip in ['SPAXX', 'HELD', 'US DOLLARS', 'MONEY']):
+                    # Skip cash, crypto, and special positions
+                    if any(skip in ticker for skip in ['SPAXX', 'HELD', 'US DOLLARS', 'MONEY', 'USD', 'FCASH', 'CORE']):
                         print(f"    ⏭️  Cash position")
                         continue
-                    
+
+                    # Skip tickers with special characters (*, **, etc. = Fidelity cash/special)
+                    if '*' in ticker:
+                        print(f"    ⏭️  Special position (contains *)")
+                        continue
+
+                    # Skip crypto
+                    if '/' in ticker:
+                        print(f"    ⏭️  Crypto position: {ticker}")
+                        continue
+
                     # Skip junk
                     if len(ticker) > 10:
                         print(f"    ⏭️  Junk row")
                         continue
-                    
+
                     # Clean ticker
-                    ticker = re.sub(r'[^A-Z/]', '', ticker)
-                    
-                    # Handle BTC/USD
-                    if '/' in ticker:
-                        ticker = ticker.split('/')[0]
+                    ticker = re.sub(r'[^A-Z]', '', ticker)
                     
                     # Valid ticker should be 1-5 chars
                     if len(ticker) < 1 or len(ticker) > 5:
