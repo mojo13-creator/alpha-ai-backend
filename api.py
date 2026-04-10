@@ -563,7 +563,7 @@ async def get_portfolio_history():
         if portfolio_df is None:
             return {"history": []}
 
-        portfolio_df = portfolio_df.fillna(method="ffill").fillna(0)
+        portfolio_df = portfolio_df.ffill().fillna(0)
         portfolio_df["total"] = portfolio_df.sum(axis=1)
 
         # Resample to weekly for cleaner chart
