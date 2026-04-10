@@ -600,13 +600,15 @@ async def get_watchlist():
                 try:
                     ticker = yf.Ticker(symbol)
                     info = ticker.fast_info
-                    price = float(info.last_price)
-                    prev = float(info.previous_close)
+                    price = safe_float(info.last_price)
+                    prev = safe_float(info.previous_close)
                     change = ((price - prev) / prev * 100) if prev > 0 else 0
-                    market_cap = float(info.market_cap) if hasattr(info, "market_cap") else 0
                 except:
                     price = 0
                     change = 0
+                try:
+                    market_cap = safe_float(getattr(info, "market_cap", 0))
+                except:
                     market_cap = 0
 
                 # Get latest AI recommendation from DB
