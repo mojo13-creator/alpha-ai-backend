@@ -253,7 +253,7 @@ def _build_multi_model(claude_result, gemini_result, chatgpt_result=None):
 
 def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
                             reddit_scraper=None, finviz_data=None, skip_ai=False,
-                            use_berkeley=True):
+                            use_berkeley=True, user_period=None):
     """
     Run the full composite analysis pipeline for a symbol.
     Returns the complete analysis result dict matching the API response schema.
@@ -374,6 +374,7 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         news_headlines=news_articles[:8],
         df=df,
         berkeley_data=berkeley_data or None,
+        user_period=user_period,
     )
 
     if skip_ai:

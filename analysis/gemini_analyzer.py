@@ -46,7 +46,7 @@ class GeminiAnalyzer:
 
     def get_gemini_insight_score(self, symbol, price, stock_info, technical_result,
                                  fundamental_result, sentiment_result, news_headlines,
-                                 df=None, berkeley_data=None):
+                                 df=None, berkeley_data=None, user_period=None):
         """
         Call Gemini API for an independent AI Insight score.
         Returns dict matching the same schema as Claude's AI Insight result.

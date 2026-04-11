@@ -3,6 +3,9 @@
 FastAPI Backend for Alpha AI
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -80,6 +83,7 @@ async def analyze_stock(request: AnalysisRequest):
             news_scraper=news_scraper,
             reddit_scraper=reddit_scraper_instance,
             finviz_data=finviz_data,
+            user_period=request.period,
         )
 
         if 'error' in result:
@@ -127,9 +131,10 @@ async def get_dashboard():
                     "timestamp": str(row.get("date", "")),
                 })
 
-        # 2. Watchlist with real prices
+        # 2. Watchlist with real prices (fetch recommendations ONCE, not per-symbol)
         watchlist_df = db.get_watchlist()
         watchlist = []
+        all_recs = db.get_latest_recommendations(days=30, limit=50)
         if watchlist_df is not None and not watchlist_df.empty:
             for _, row in watchlist_df.iterrows():
                 symbol = str(row.get("symbol", ""))
@@ -142,12 +147,10 @@ async def get_dashboard():
                 except:
                     price = 0
                     change = 0
-                # Get latest AI score if available
-                rec = db.get_latest_recommendations(days=30, limit=1)
                 score = 50
                 recommendation = "HOLD"
-                if rec is not None and not rec.empty:
-                    sym_rec = rec[rec["symbol"] == symbol]
+                if all_recs is not None and not all_recs.empty:
+                    sym_rec = all_recs[all_recs["symbol"] == symbol]
                     if not sym_rec.empty:
                         score = int(sym_rec.iloc[0].get("score", 50))
                         recommendation = str(sym_rec.iloc[0].get("recommendation", "HOLD"))
@@ -206,18 +209,47 @@ async def get_dashboard():
                     continue
         alerts = alerts[:5]
 
-        # 5. Portfolio stats (from DB if available, else empty)
-        portfolio_value = 0
-        positions = 0
+        # 5. Portfolio stats — compute real values
+        portfolio_value = 0.0
+        total_cost = 0.0
+        total_pnl = 0.0
+        position_count = 0
+        positions_with_alerts = 0
         try:
-            import sqlite3
-            conn = sqlite3.connect("stock_data.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM portfolio")
-            positions = cursor.fetchone()[0]
-            conn.close()
-        except:
+            active_positions = db.get_active_positions()
+            position_count = len(active_positions)
+            for pos in active_positions:
+                shares = safe_float(pos.get("shares", 0))
+                entry_price = safe_float(pos.get("purchase_price", 0))
+                current_price = safe_float(pos.get("current_price", 0))
+                if current_price <= 0:
+                    try:
+                        ticker_obj = yf.Ticker(pos["symbol"])
+                        current_price = float(ticker_obj.fast_info.last_price)
+                    except Exception:
+                        current_price = entry_price
+                portfolio_value += shares * current_price
+                total_cost += shares * entry_price
+                if pos.get("alert"):
+                    positions_with_alerts += 1
+            total_pnl = portfolio_value - total_cost
+        except Exception:
             pass
+
+        total_pnl_pct = ((total_pnl / total_cost) * 100) if total_cost > 0 else 0.0
+
+        # 6. Win rate from recent analyses
+        win_count = 0
+        total_scored = 0
+        if recent_recs is not None and not recent_recs.empty:
+            for _, row in recent_recs.iterrows():
+                rec = str(row.get("recommendation", "")).upper()
+                if rec in ("STRONG BUY", "BUY", "SELL", "STRONG SELL", "SHORT"):
+                    total_scored += 1
+                    score = int(row.get("score", 50))
+                    if score >= 60:
+                        win_count += 1
+        win_rate = round((win_count / total_scored) * 100) if total_scored > 0 else 0
 
         return {
             "recent_analyses": recent_analyses,
@@ -225,8 +257,13 @@ async def get_dashboard():
             "market_data": market_data,
             "alerts": alerts,
             "portfolio": {
-                "value": portfolio_value,
-                "positions": positions,
+                "value": round(portfolio_value, 2),
+                "cost": round(total_cost, 2),
+                "pnl": round(total_pnl, 2),
+                "pnl_pct": round(total_pnl_pct, 2),
+                "positions": position_count,
+                "positions_with_alerts": positions_with_alerts,
+                "win_rate": win_rate,
             }
         }
 
@@ -1479,16 +1516,56 @@ async def get_paper_trading_history():
 
 @app.post("/api/paper-trading/run-algo")
 async def run_paper_trading_algo():
-    """Trigger the daily paper trading algorithm manually."""
-    try:
-        from trading.paper_trader import PaperTrader
-        trader = PaperTrader(db, analyzer, news_scraper)
-        result = trader.run_daily_algo()
-        return result
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    """Trigger the daily paper trading algorithm with SSE progress streaming."""
+    import asyncio
+    import queue
+    import threading
+    from fastapi.responses import StreamingResponse
+
+    progress_queue = queue.Queue()
+
+    def on_progress(step, detail=""):
+        progress_queue.put({"step": step, "detail": detail})
+
+    result_holder = [None]
+    error_holder = [None]
+
+    def run_algo():
+        try:
+            from trading.paper_trader import PaperTrader
+            trader = PaperTrader(db, analyzer, news_scraper, on_progress=on_progress)
+            result_holder[0] = trader.run_daily_algo()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_holder[0] = str(e)
+        finally:
+            progress_queue.put(None)  # sentinel
+
+    thread = threading.Thread(target=run_algo, daemon=True)
+    thread.start()
+
+    async def event_stream():
+        import json as _json
+        while True:
+            try:
+                msg = await asyncio.get_event_loop().run_in_executor(None, progress_queue.get, True, 0.5)
+            except queue.Empty:
+                # Send keepalive comment
+                yield ": keepalive\n\n"
+                continue
+
+            if msg is None:
+                # Algo finished — send final result
+                if error_holder[0]:
+                    yield f"data: {_json.dumps({'type': 'error', 'detail': error_holder[0]})}\n\n"
+                else:
+                    yield f"data: {_json.dumps({'type': 'result', **result_holder[0]})}\n\n"
+                break
+            else:
+                yield f"data: {_json.dumps({'type': 'progress', **msg})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/api/paper-trading/reset")

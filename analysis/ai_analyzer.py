@@ -34,7 +34,7 @@ class AIStockAnalyzer:
 
     def get_ai_insight_score(self, symbol, price, stock_info, technical_result,
                               fundamental_result, sentiment_result, news_headlines,
-                              df=None, berkeley_data=None):
+                              df=None, berkeley_data=None, user_period=None):
         """
         Call Claude API for the AI Insight sub-score.
         Receives all other sub-scores + raw data. Returns dict with score,
@@ -54,7 +54,7 @@ class AIStockAnalyzer:
             prompt = self._build_prompt(
                 symbol, price, stock_info, technical_result,
                 fundamental_result, sentiment_result, news_headlines, df,
-                berkeley_data
+                berkeley_data, user_period
             )
 
             message = client.messages.create(
@@ -71,7 +71,8 @@ class AIStockAnalyzer:
             return self._fallback_result(str(e))
 
     def _build_prompt(self, symbol, price, stock_info, technical, fundamental,
-                      sentiment, news_headlines, df, berkeley_data=None):
+                      sentiment, news_headlines, df, berkeley_data=None,
+                      user_period=None):
         """Build the decisive analyst prompt with all data."""
 
         # Gather technical details from the dataframe
@@ -120,9 +121,17 @@ COMPANY INFO:
         else:
             news_block += "  No recent news available\n"
 
+        # Map period codes to readable investment horizons
+        period_map = {
+            '1mo': '1 month', '3mo': '3 months', '6mo': '6 months',
+            '1y': '1 year', '2y': '2 years',
+        }
+        horizon_label = period_map.get(user_period, '6 months') if user_period else '6 months'
+
         prompt = f"""You are a decisive stock analyst. You DO NOT hedge. You DO NOT cluster scores in the safe middle range.
 
 ANALYZE: {symbol} at ${price:.2f}
+INVESTMENT HORIZON: {horizon_label} — the user is evaluating this stock for a {horizon_label} hold. Your entry_price, stop_loss, target_price, and time_horizon MUST be calibrated to this timeframe. Do NOT suggest a 1-2 week target if the user is looking at 3 months.
 {info_block}
 {tech_details}
 
@@ -159,6 +168,14 @@ SCORING RULES YOU MUST FOLLOW:
 You MUST justify your score with specific data points, not vague statements.
 If you are uncertain, your score should reflect that uncertainty by being LOWER, not by being in the middle.
 
+STRATEGY RULES — read carefully:
+- For STRONG BUY / BUY: entry_price = ideal buy price (at or slightly below current), target_price = profit target ABOVE entry, stop_loss = exit price BELOW entry to limit losses.
+- For SELL / STRONG SELL: entry_price = price to sell/exit at (at or near current), target_price = lower price where re-entry becomes attractive, stop_loss = price ABOVE current that would invalidate the bearish thesis (i.e. "you were wrong if it hits this").
+- For HOLD: entry_price = current price, target_price = upside level to watch, stop_loss = downside level that would trigger a sell.
+- For SHORT: entry_price = price to short at, target_price = cover target BELOW entry, stop_loss = price ABOVE entry to cut losses.
+- target_price must ALWAYS be in the profitable direction for the action. Never set a target that loses money on the trade.
+- stop_loss must ALWAYS be in the losing direction for the action. It is the "I was wrong" exit.
+
 Respond ONLY with valid JSON in this exact format:
 {{
     "score": <integer 0-100>,
@@ -180,7 +197,7 @@ Respond ONLY with valid JSON in this exact format:
         if not berkeley_data:
             return ""
 
-        lines = ["INSTITUTIONAL DATA (from Capital IQ / Orbis / Statista — treat as high-quality signals):"]
+        lines = ["INSTITUTIONAL DATA (Capital IQ, WRDS, IBISWorld, Fitch, Orbis, Finaeon, Statista — treat as high-quality signals):"]
 
         capiq = berkeley_data.get("capital_iq", {})
         if capiq:
@@ -244,6 +261,47 @@ Respond ONLY with valid JSON in this exact format:
             if fitch.get("sector_credit_outlook"):
                 lines.append(f"  Sector credit outlook: {fitch['sector_credit_outlook'][:200]}")
 
+        wrds = berkeley_data.get("wrds", {})
+        if wrds:
+            compustat_q = wrds.get("compustat_quarterly", [])
+            if compustat_q:
+                latest_q = compustat_q[0] if compustat_q else {}
+                rev = latest_q.get("revtq")
+                ni = latest_q.get("niq")
+                eps = latest_q.get("epspxq")
+                if rev is not None:
+                    lines.append(f"  WRDS Compustat quarterly revenue: ${rev:,.0f}M" if rev > 1000 else f"  WRDS Compustat quarterly revenue: ${rev:,.2f}M")
+                if ni is not None:
+                    lines.append(f"  WRDS Compustat quarterly net income: ${ni:,.2f}M")
+                if eps is not None:
+                    lines.append(f"  WRDS Compustat quarterly EPS: ${eps:.2f}")
+            compustat_a = wrds.get("compustat_annual", [])
+            if compustat_a and len(compustat_a) >= 2:
+                curr_rev = compustat_a[0].get("revt")
+                prev_rev = compustat_a[1].get("revt")
+                if curr_rev and prev_rev and prev_rev > 0:
+                    yoy_growth = ((curr_rev - prev_rev) / prev_rev) * 100
+                    lines.append(f"  WRDS annual revenue growth: {yoy_growth:+.1f}% YoY")
+            crsp = wrds.get("crsp_daily_returns", [])
+            if crsp and len(crsp) >= 20:
+                recent_rets = [r.get("ret", 0) for r in crsp[-20:] if r.get("ret") is not None]
+                if recent_rets:
+                    avg_ret = sum(recent_rets) / len(recent_rets) * 100
+                    lines.append(f"  WRDS CRSP 20-day avg daily return: {avg_ret:+.3f}%")
+
+        finaeon = berkeley_data.get("finaeon", {})
+        if finaeon:
+            hist_prices = finaeon.get("historical_prices", [])
+            if hist_prices:
+                lines.append(f"  Finaeon deep history: {len(hist_prices)} data points available")
+            sector_idx = finaeon.get("sector_index", {})
+            if sector_idx.get("performance"):
+                lines.append(f"  Finaeon sector index: {sector_idx['performance'][:200]}")
+            commodity = finaeon.get("commodity_prices", [])
+            if commodity:
+                for c in commodity[:2]:
+                    lines.append(f"  Related commodity ({c.get('name', 'N/A')}): {c.get('latest', 'N/A')}")
+
         if len(lines) <= 1:
             return ""
 
@@ -256,16 +314,35 @@ Respond ONLY with valid JSON in this exact format:
             json_match = re.search(r'\{[\s\S]*\}', response_text)
             if json_match:
                 data = json.loads(json_match.group())
+                action = str(data.get('action', 'HOLD')).upper()
+                entry = safe_float(data.get('entry_price', 0))
+                stop = safe_float(data.get('stop_loss', 0))
+                target = safe_float(data.get('target_price', 0))
+
+                # Sanity-check: fix inverted target/stop for the action direction
+                if action in ('STRONG BUY', 'BUY', 'HOLD'):
+                    # Target should be above entry, stop below
+                    if entry > 0 and target > 0 and target < entry:
+                        target, stop = stop, target  # swap
+                    if entry > 0 and stop > 0 and stop > entry:
+                        target, stop = stop, target  # swap
+                elif action in ('SELL', 'STRONG SELL', 'SHORT'):
+                    # Target should be below entry, stop above
+                    if entry > 0 and target > 0 and target > entry:
+                        target, stop = stop, target  # swap
+                    if entry > 0 and stop > 0 and stop < entry:
+                        target, stop = stop, target  # swap
+
                 return {
                     'score': max(0, min(100, int(data.get('score', 50)))),
                     'reasoning': str(data.get('reasoning', '')),
                     'agreements': data.get('agreements', []),
                     'disagreements': data.get('disagreements', []),
                     'risks': data.get('risks', []),
-                    'action': str(data.get('action', 'HOLD')),
-                    'entry_price': safe_float(data.get('entry_price', 0)),
-                    'stop_loss': safe_float(data.get('stop_loss', 0)),
-                    'target_price': safe_float(data.get('target_price', 0)),
+                    'action': action,
+                    'entry_price': entry,
+                    'stop_loss': stop,
+                    'target_price': target,
                     'time_horizon': str(data.get('time_horizon', '')),
                 }
         except (json.JSONDecodeError, Exception) as e:
