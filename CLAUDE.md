@@ -1,301 +1,186 @@
 # CLAUDE.md — Alpha AI Backend
 
-This file is the persistent context for all Claude Code sessions on this repo.
-Read this file at the start of every session before touching any code.
-
 ---
 
 ## Project Identity
 
-**Alpha AI** is a real, revenue-intended AI stock analysis SaaS.
-- Owner: Connor (Fidelity account XXXXX4416)
-- Status: Personal use before public launch
-- Pricing at launch: $29/month Pro, $79/month Elite
-- This is NOT a tutorial or demo project. Every decision should be production-quality.
+**Alpha AI** — revenue-intended AI stock analysis SaaS. NOT a tutorial.
+- Owner: Connor | Fidelity XXXXX4416
+- Pricing: $29/mo Pro, $79/mo Elite
+- Every decision should be production-quality.
 
----
+## URLs & Paths
 
-## Live URLs
-
-| Service | URL |
+| | URL / Path |
 |---|---|
-| Frontend (Vercel) | https://alpha-ai-app-pied.vercel.app |
-| Backend (Railway) | https://web-production-27e7e9.up.railway.app |
-| GitHub (frontend) | https://github.com/mojo13-creator/alpha-ai-app |
-| GitHub (backend) | https://github.com/mojo13-creator/alpha-ai-backend |
-
----
-
-## Local File Paths
-
-| Repo | Path |
-|---|---|
-| Backend | ~/Desktop/stock-analyzer |
-| Frontend | ~/Desktop/alpha-ai-app |
-| Landing page | ~/Desktop/alpha-ai-landing |
-| Python venv | ~/Desktop/stock-analyzer/venv |
-
----
+| Frontend | https://alpha-ai-app-pied.vercel.app |
+| Backend | https://web-production-27e7e9.up.railway.app |
+| GitHub FE | github.com/mojo13-creator/alpha-ai-app |
+| GitHub BE | github.com/mojo13-creator/alpha-ai-backend |
+| Local BE | ~/Desktop/stock-analyzer |
+| Local FE | ~/Desktop/alpha-ai-app |
+| Venv | ~/Desktop/stock-analyzer/venv |
 
 ## Tech Stack
 
-### Backend
-- Python 3.13 (Railway), 3.14 (local)
-- FastAPI + Uvicorn
-- SQLite (local) / PostgreSQL (Railway) — db_manager handles both automatically
-- python-dotenv for env var loading
-- slowapi for rate limiting
-- anthropic SDK (Claude Sonnet `claude-sonnet-4-20250514`)
-- yfinance, newsapi-python, finvizfinance, praw
+**Backend:** Python 3.13 (Railway) / 3.14 (local), FastAPI, SQLite (local) / PostgreSQL (Railway), slowapi, anthropic SDK, yfinance, newsapi.ai (Event Registry, via requests), finvizfinance, praw
 
-### Frontend
-- Next.js 14 (App Router), TypeScript
-- Tailwind CSS
-- Framer Motion (animations)
-- shadcn/ui (component library)
-- Recharts (charts)
-- Clerk (auth — dev keys, needs production keys before launch)
+**Frontend:** Next.js 14 (App Router), TypeScript, Tailwind, Framer Motion, shadcn/ui, Recharts, Clerk auth (dev keys)
 
-### AI / Data
-- Claude Sonnet (`claude-sonnet-4-20250514`) — primary AI engine
-- Gemini API (`gemini-2.5-flash`) — second AI opinion
-- OpenAI GPT-4o — third AI opinion (3-model consensus)
-- Perplexity API — planned (Feature 6, key not yet provided)
-- NewsAPI, Reddit public JSON, Finviz
+**AI Models:** Claude Sonnet (`claude-sonnet-4-20250514`), Gemini (`gemini-2.5-flash`), GPT-4o — 3-model consensus. Perplexity planned (no key yet).
 
 ---
 
-## File Structure — Backend
+## File Structure
 
 ```
-stock-analyzer/
-├── api.py                          # FastAPI app — all endpoints live here
-├── config.py                       # All settings; keys loaded from .env via os.environ
-├── .env                            # Local secrets — NEVER commit
-├── .env.example                    # Safe template — committed
-├── requirements.txt                # Python dependencies
-├── SECURITY.md                     # Security rules and env var reference
-├── CLAUDE.md                       # This file
-│
-├── analysis/
-│   ├── ai_analyzer.py              # Claude AI stock analysis engine
-│   ├── chatgpt_analyzer.py         # ChatGPT (GPT-4o) AI insight engine
-│   ├── ai.analyzer.py              # Legacy/duplicate — do not use for new work
-│   ├── hybrid_recommender.py       # Combines technical + AI signals
-│   ├── technical_analysis.py       # RSI, MACD, Bollinger Bands, SMA, etc.
-│   ├── recommendation_engine.py
-│   ├── stock_screener.py
-│   ├── discovery_engine.py
-│   └── backtester.py
-│
-├── data_collection/
-│   ├── stock_data.py               # yfinance wrapper (StockDataCollector)
-│   ├── news_scraper.py             # NewsAPI wrapper (NewsScraper)
-│   ├── reddit_scraper.py           # Reddit scraper (RedditScraper class)
-│   └── finviz_scraper.py           # Finviz screener (FinvizScraper)
-│
-├── database/
-│   └── db_manager.py               # SQLite/PostgreSQL abstraction (DatabaseManager)
-│
-├── portfolio/
-│   ├── fidelity_importer.py
-│   └── portfolio_tracker.py
-│
-├── reports/
-│   └── report_generator.py         # ReportGenerator class
-│
-├── utils/
-│   ├── alerts.py
-│   ├── scheduler.py
-│   └── visualizations.py
-│
-└── ui/
-    └── dashboard.py                # Legacy Streamlit UI — not used in production
+analysis/
+  ai_analyzer.py          # Claude AI engine
+  gemini_analyzer.py       # Gemini engine
+  chatgpt_analyzer.py      # GPT-4o engine
+  composite_scorer.py      # Master scorer: sub-scores + 3-model AI consensus
+  technical_scorer.py      # Quant technical score (0-100)
+  fundamental_scorer.py    # Quant fundamental score (0-100)
+  sentiment_scorer.py      # Quant sentiment score (0-100)
+  horizon_screener.py      # 3-horizon screener (short/mid/long) — NO AI calls
+  technical_analysis.py    # RSI, MACD, Bollinger, SMA, indicators
+  hybrid_recommender.py    # Technical + AI signal combiner
+  stock_screener.py        # Preset screening strategies
+  discovery_engine.py      # Hidden gem / catalyst discovery
+  ai.analyzer.py           # LEGACY — do not use
+
+data_collection/
+  stock_data.py            # yfinance wrapper (StockDataCollector)
+  news_scraper.py          # NewsAPI (NewsScraper)
+  reddit_scraper.py        # Reddit (RedditScraper class)
+  finviz_scraper.py        # Finviz (FinvizScraper)
+  berkeley/                # Institutional data (CapIQ, WRDS, IBISWorld, Orbis, Statista)
+
+reports/
+  report_generator.py      # Personalized portfolio reports
+  report_scheduler.py      # Daily report orchestration
+  daily_screener.py        # 3-stage pipeline: gather → filter → analyze
+
+database/db_manager.py     # SQLite/PostgreSQL abstraction
+portfolio/                 # fidelity_importer.py, portfolio_tracker.py
+trading/paper_trader.py    # Paper trading engine
 ```
 
----
-
-## Critical Import Rules — NEVER Change These
+## Critical Imports — NEVER Change
 
 ```python
 from data_collection.stock_data import StockDataCollector
 from analysis.technical_analysis import TechnicalAnalyzer
 from data_collection.news_scraper import NewsScraper
-from data_collection.reddit_scraper import RedditScraper       # class, NOT fetch_reddit_sentiment
+from data_collection.reddit_scraper import RedditScraper
 from analysis.hybrid_recommender import HybridRecommender
 from data_collection.finviz_scraper import FinvizScraper
 from reports.report_generator import ReportGenerator
 ```
 
----
-
 ## API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| POST | /api/analyze | Full AI stock analysis |
+| POST | /api/analyze | Full AI analysis (3-model consensus) |
 | GET | /api/dashboard | Dashboard data |
 | GET/POST/DELETE | /api/portfolio | Portfolio CRUD |
 | GET | /api/portfolio/history | Portfolio value history |
+| POST | /api/portfolio/from-report | Add screener pick to portfolio |
 | GET/POST/DELETE | /api/watchlist | Watchlist CRUD |
 | GET | /api/alerts | Technical alerts |
-| GET | /api/reports/daily | Daily AI report |
-| GET | /api/reports/weekly | Weekly AI report |
-| GET | /api/reports/monthly | Monthly AI report |
-| GET | /api/finviz/screener | Finviz screener signals |
-| GET | /api/finviz/strong-buys | Finviz strong buys |
+| GET | /api/market/summary | Index prices + sector outlook (no AI) |
+| GET | /api/screener/all | 3-horizon screen + AI top 3 (cached 60 min) |
+| GET | /api/screener/short-term | Momentum picks, 1-2 days (no AI) |
+| GET | /api/screener/mid-term | Swing trades, 2-8 weeks (no AI) |
+| GET | /api/screener/long-term | Core holdings, 3+ months (no AI) |
+| GET | /api/analysis/{ticker}/history | Last 30 analyses for trend chart |
+| GET | /api/reports/daily | Legacy daily AI report |
+| GET | /api/reports/weekly | Weekly report |
+| GET | /api/reports/monthly | Monthly report |
+| GET | /api/finviz/screener | Finviz signals |
 | GET | /api/news/feed | AI-analyzed news feed |
 | GET/POST | /api/portfolio/pending | Fidelity import queue |
-| POST | /api/portfolio/pending/confirm | Confirm imported trade |
-| DELETE | /api/portfolio/pending/{id} | Dismiss pending import |
 
 ---
 
-## Environment Variables
+## Security — ALWAYS Enforce
 
-### .env location: ~/Desktop/stock-analyzer/.env (NEVER commit this file)
+1. **NEVER hardcode secrets.** All keys from env vars only.
+2. **NEVER commit `.env`.** `.gitignore` blocks `.env*` (except `.env.example`).
+3. **Before every commit:** `grep -rn "sk-ant-\|sk_test_\|pk_test_" --include="*.py" --exclude-dir=venv .`
+4. **Never log keys** in print/error/traceback.
+5. **Validate all ticker inputs** via `validate_ticker()` in `api.py`.
+6. **CORS:** `alpha-ai-app-pied.vercel.app` + `localhost:3000` only.
+7. **Rate limits:** `/api/analyze` 20/min, `/api/reports/*` 5/min, `/api/news/feed` 15/min, default 60/min.
 
-| Variable | Description | Required |
-|---|---|---|
-| `CLAUDE_API_KEY` | Anthropic Claude API key | Yes |
-| `NEWS_API_KEY` | NewsAPI key | Yes |
-| `FIDELITY_USERNAME` | Fidelity username | Future |
-| `FIDELITY_PASSWORD` | Fidelity password | Future |
-| `GEMINI_API_KEY` | Google Gemini key | Yes |
-| `OPENAI_API_KEY` | OpenAI GPT-4o key | Yes |
-| `PERPLEXITY_API_KEY` | Perplexity key | Future (Feature 6) |
+## Env Vars
 
-### How keys are loaded — always use this pattern:
-```python
-from dotenv import load_dotenv
-import os
-load_dotenv()
-api_key = os.environ.get("KEY_NAME")
-if not api_key:
-    raise ValueError("KEY_NAME not set — add it to your .env file")
-```
+`.env` at `~/Desktop/stock-analyzer/.env` — load with `os.environ.get()` after `load_dotenv()`.
 
-### Railway (production) env vars — set in Railway dashboard:
-- `CLAUDE_API_KEY`
-- `NEWS_API_KEY`
-- `GEMINI_API_KEY`
-- `OPENAI_API_KEY`
-- `DATABASE_URL` (set automatically by Railway PostgreSQL plugin)
+| Variable | Required |
+|---|---|
+| `CLAUDE_API_KEY` | Yes |
+| `NEWS_API_KEY` | Yes |
+| `GEMINI_API_KEY` | Yes |
+| `OPENAI_API_KEY` | Yes |
+| `PERPLEXITY_API_KEY` | Future |
+
+Railway also has `DATABASE_URL` (auto-set by PostgreSQL plugin).
 
 ---
 
-## Security Rules — Permanent, Apply Every Session
+## Coding Rules
 
-1. **NEVER hardcode any API key, token, password, or secret in any file.**
-2. **NEVER commit `.env` or `.env.*` files.** The `.gitignore` blocks `.env*` (except `.env.example`).
-3. **Before every `git add` or commit**, scan for exposed secrets:
-   ```bash
-   grep -rn "sk-ant-\|sk_test_\|pk_test_" --include="*.py" --exclude-dir=venv .
-   ```
-4. **All new API integrations** (Gemini, Perplexity, Fidelity) must load keys from env vars only.
-5. **Never log API keys** in print statements, error messages, or tracebacks.
-6. **Never include API keys in comments, prompts, or documentation.**
-7. **All ticker/symbol inputs** must be validated through `validate_ticker()` in `api.py` before use.
-8. **CORS** is restricted to `https://alpha-ai-app-pied.vercel.app` and `localhost:3000` only.
-9. **Rate limits**: `/api/analyze` → 20/min, `/api/reports/*` → 5/min, `/api/news/feed` → 15/min, default → 60/min.
+- **NEVER `if df:`** on DataFrames — use `if df is None or df.empty:`
+- **ALWAYS `safe_float()`** for float conversions from indicators
+- **NEVER use `sed`** — use Edit tool or Python
+- **NEVER `git add -A` or `git add .`** — always add specific files
+- **pip outside venv:** `--break-system-packages`
 
----
-
-## Python Coding Rules
-
-- **NEVER use `if df:`** on pandas DataFrames — use `if df is None or df.empty:`
-- **ALWAYS use `safe_float()`** for float conversions from technical indicators
-- **NEVER use `sed`** for file edits — use the Edit tool or Python
-- **NEVER use heredoc (`cat >`)** for writing long files — use the Write tool or Python
-- **pip installs outside venv**: use `--break-system-packages`
-
-### safe_float definition (in api.py):
-```python
-def safe_float(val, default=0.0):
-    try:
-        v = float(val)
-        return default if math.isnan(v) or math.isinf(v) else v
-    except:
-        return default
-```
-
----
-
-## How to Run Locally
+## Run Locally
 
 ```bash
-# Kill any existing backend
 lsof -ti:8000 | xargs kill -9
-
-# Start backend
-cd ~/Desktop/stock-analyzer
-source venv/bin/activate
+cd ~/Desktop/stock-analyzer && source venv/bin/activate
 uvicorn api:app --reload --port 8000
 ```
 
----
+## Deploy
 
-## Deployment Process
+Backend: `git push origin main` → Railway auto-deploys
+Frontend: `git push origin main` (from ~/Desktop/alpha-ai-app) → Vercel auto-deploys
 
-### Backend → Railway
-```bash
-cd ~/Desktop/stock-analyzer
-git add <specific files>          # Never use git add -A or git add .
-git commit -m "message"
-git push origin main              # Railway auto-deploys on push
-```
+Pre-push: check no `.env` staged, no hardcoded secrets, `python3 -c "import ast; ast.parse(open('api.py').read())"`.
 
-### Frontend → Vercel
-```bash
-cd ~/Desktop/alpha-ai-app
-git add <specific files>
-git commit -m "message"
-git push origin main              # Vercel auto-deploys on push
-```
-
-### Before every push — run this checklist:
-```bash
-# 1. No .env files staged
-git status | grep ".env"
-
-# 2. No hardcoded secrets
-grep -rn "sk-ant-\|sk_test_" --include="*.py" --exclude-dir=venv .
-
-# 3. Syntax check
-python3 -c "import ast; ast.parse(open('api.py').read()); print('OK')"
-```
-
-### Git identity:
-```bash
-git config --global user.name "mojo13-creator"
-```
+Git user: `mojo13-creator`
 
 ---
 
 ## Build Roadmap
 
-Work through these in order unless Connor instructs otherwise.
-
 | # | Feature | Status |
 |---|---|---|
-| 1 | News Intelligence Tab (`/news`) | ✅ Complete |
-| 2 | Rebuilt Daily Reports (`/reports`) | ⬜ Next |
-| 3 | Portfolio Tiers + Daily Scoring | ⬜ Pending |
-| 4 | Paper Trading Tab (`/paper-trading`) | ⬜ Pending |
-| 5 | Gemini API Integration | ⬜ Waiting on key |
-| 6 | Perplexity API Integration | ⬜ Waiting on key |
+| 1 | News Intelligence (`/news`) | Done |
+| 2 | Unified Reports + Screener (`/reports`) | Done — 3-horizon + AI top 3 |
+| 3 | Portfolio Tiers + Daily Scoring | Next |
+| 4 | Paper Trading (`/paper-trading`) | Pending |
+| 5 | Gemini Integration | Done — 2nd AI model in composite scorer |
+| 6 | Perplexity Integration | Waiting on key |
 
-### Stop and ask Connor before continuing when:
-- A database migration is required
-- A new paid API needs a key that hasn't been provided
-- Two valid implementation paths exist and the choice affects the architecture
-- An error cannot be resolved in 2 attempts
-- A feature is complete and ready for review
-- Any file deletion is required
+### Ask Connor before:
+- Database migrations
+- New paid API keys not yet provided
+- Architectural forks with multiple valid paths
+- After 2 failed attempts at an error
+- When a feature is complete and ready for review
+- Any file deletion
 
 ---
 
-## Checkpoint Format
+## Session End Protocol
 
-After each major step output: `✅ [what was completed and which files were changed]`
-After each full feature: output a summary of every file added or modified.
+Before ending any session or when context is getting long:
+- Update this file if file structure, endpoints, or roadmap changed
+- Save non-obvious decisions or user preferences to memory
+- Summarize what was done and what's next

@@ -1,153 +1,180 @@
 # data_collection/news_scraper.py
 """
-News Scraper - Fetches latest financial news
+News Scraper - Fetches latest financial news via newsapi.ai (Event Registry).
+
+Public interface is preserved for drop-in compatibility with the prior
+newsapi.org-based implementation: NewsScraper(db_manager),
+fetch_stock_news(symbol, days=7), fetch_general_market_news(days=1),
+save_news(news_list). Returned article dicts keep the same keys
+(symbol, title, description, url, source, published_at, content).
 """
 
 from datetime import datetime, timedelta
+import requests
 import config
 
+EVENT_REGISTRY_URL = "https://eventregistry.org/api/v1/article/getArticles"
+
+
 class NewsScraper:
-    """Fetches financial news from various sources"""
-    
+    """Fetches financial news from newsapi.ai (Event Registry)."""
+
     def __init__(self, db_manager):
         self.db = db_manager
         print("📰 News Scraper initializing...")
-        
-        # Reload config to get latest values
+
         import importlib
         importlib.reload(config)
-        
-        print(f"   API Key: {config.NEWS_API_KEY[:10]}..." if len(config.NEWS_API_KEY) > 10 else "   API Key: NOT SET")
-        
-        # Check if News API is configured
-        if config.NEWS_API_KEY == "your_newsapi_key_here" or not config.NEWS_API_KEY:
 
-            print("⚠️  News API not configured. Get a key from https://newsapi.org")
-            self.newsapi = None
+        key = config.NEWS_API_KEY or ""
+        print(f"   API Key: {key[:10]}..." if len(key) > 10 else "   API Key: NOT SET")
+
+        if not key or key == "your_newsapi_key_here":
+            print("⚠️  News API not configured. Get a key from https://newsapi.ai")
+            self.api_key = None
         else:
-            try:
-                from newsapi import NewsApiClient
-                self.newsapi = NewsApiClient(api_key=config.NEWS_API_KEY)
-                print("✅ News API connected")
-            except ImportError:
-                print("⚠️  newsapi-python not installed. Run: pip install newsapi-python")
-                self.newsapi = None
-            except Exception as e:
-                print(f"❌ News API connection failed: {e}")
-                self.newsapi = None
-    
+            self.api_key = key
+            print("✅ News API (newsapi.ai / Event Registry) configured")
+
+    def _post(self, payload):
+        payload = dict(payload)
+        payload["apiKey"] = self.api_key
+        r = requests.post(EVENT_REGISTRY_URL, json=payload, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(f"newsapi.ai error: {data['error']}")
+        return data
+
+    @staticmethod
+    def _normalize(article, symbol=None):
+        body = article.get("body", "") or ""
+        description = body[:300].strip()
+        source = article.get("source") or {}
+        dt_pub = article.get("dateTimePub") or article.get("dateTime") or ""
+        return {
+            "symbol": symbol,
+            "title": article.get("title", "") or "",
+            "description": description,
+            "url": article.get("url", "") or "",
+            "source": source.get("title") or source.get("uri") or "Unknown",
+            "published_at": dt_pub,
+            "content": body,
+        }
+
     def fetch_stock_news(self, symbol, days=7):
-        """Fetch news for a specific stock"""
-        if not self.newsapi:
+        """Fetch news for a specific stock."""
+        if not self.api_key:
             print("⚠️  News API not available")
-            # Return mock data for testing
             return [{
-                'symbol': symbol,
-                'title': f'Mock news for {symbol}',
-                'description': 'News API not configured. Add your API key to config.py',
-                'url': 'https://newsapi.org',
-                'source': 'Mock',
-                'published_at': datetime.now().isoformat()
+                "symbol": symbol,
+                "title": f"Mock news for {symbol}",
+                "description": "News API not configured. Add NEWS_API_KEY to .env",
+                "url": "https://newsapi.ai",
+                "source": "Mock",
+                "published_at": datetime.now().isoformat(),
+                "content": "",
             }]
-        
+
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=days)
+
+        print(f"📰 Fetching news for {symbol}...")
         try:
-            to_date = datetime.now()
-            from_date = to_date - timedelta(days=days)
-            
-            query = f"{symbol} stock OR {symbol} shares"
-            
-            print(f"📰 Fetching news for {symbol}...")
-            
-            articles = self.newsapi.get_everything(
-                q=query,
-                from_param=from_date.strftime('%Y-%m-%d'),
-                to=to_date.strftime('%Y-%m-%d'),
-                language='en',
-                sort_by='relevancy',
-                page_size=20
-            )
-            
-            news_list = []
-            for article in articles.get('articles', []):
-                news_list.append({
-                    'symbol': symbol,
-                    'title': article['title'],
-                    'description': article.get('description', ''),
-                    'url': article['url'],
-                    'source': article['source']['name'],
-                    'published_at': article['publishedAt'],
-                    'content': article.get('content', '')
-                })
-            
+            data = self._post({
+                "action": "getArticles",
+                "keyword": [f"{symbol} stock", f"{symbol} shares"],
+                "keywordOper": "or",
+                "lang": "eng",
+                "dateStart": from_date.strftime("%Y-%m-%d"),
+                "dateEnd": to_date.strftime("%Y-%m-%d"),
+                "articlesSortBy": "rel",
+                "articlesCount": 20,
+                "resultType": "articles",
+            })
+            results = (data.get("articles") or {}).get("results", [])
+            news_list = [self._normalize(a, symbol=symbol) for a in results]
             print(f"✅ Found {len(news_list)} news articles for {symbol}")
             return news_list
-            
         except Exception as e:
             print(f"❌ Error fetching news for {symbol}: {e}")
             return []
-    
+
     def fetch_general_market_news(self, days=1):
-        """Fetch general market news"""
-        if not self.newsapi:
+        """Fetch general market news across several catalyst buckets."""
+        if not self.api_key:
             print("⚠️  News API not available")
             return [{
-                'symbol': None,
-                'title': 'Mock market news',
-                'description': 'News API not configured. Get a free key from newsapi.org',
-                'url': 'https://newsapi.org',
-                'source': 'Mock',
-                'published_at': datetime.now().isoformat()
+                "symbol": None,
+                "title": "Mock market news",
+                "description": "News API not configured. Get a key from newsapi.ai",
+                "url": "https://newsapi.ai",
+                "source": "Mock",
+                "published_at": datetime.now().isoformat(),
             }]
-        
-        try:
-            to_date = datetime.now()
-            from_date = to_date - timedelta(days=days)
-            
-            print("📰 Fetching general market news...")
-            
-            articles = self.newsapi.get_everything(
-                q='stock market OR wall street OR nasdaq OR dow jones OR S&P 500',
-                from_param=from_date.strftime('%Y-%m-%d'),
-                to=to_date.strftime('%Y-%m-%d'),
-                language='en',
-                sort_by='publishedAt',
-                page_size=50
-            )
-            
-            news_list = []
-            for article in articles.get('articles', []):
-                news_list.append({
-                    'symbol': None,
-                    'title': article['title'],
-                    'description': article.get('description', ''),
-                    'url': article['url'],
-                    'source': article['source']['name'],
-                    'published_at': article['publishedAt']
+
+        to_date = datetime.now()
+        from_date = to_date - timedelta(days=days)
+
+        print("📰 Fetching general market news...")
+
+        # Each bucket is a list of OR'd keywords; buckets cover catalyst types.
+        keyword_buckets = [
+            ["stock market", "wall street", "nasdaq", "S&P 500"],
+            ["FDA approval", "breakthrough", "clinical trial results"],
+            ["earnings beat", "revenue surprise", "guidance raised"],
+            ["tariff", "sanctions", "geopolitical", "trade war"],
+            ["acquisition", "merger", "IPO", "buyback"],
+            ["upgrade", "price target raised", "analyst bullish"],
+        ]
+
+        news_list = []
+        seen_urls = set()
+
+        for keywords in keyword_buckets:
+            try:
+                data = self._post({
+                    "action": "getArticles",
+                    "keyword": keywords,
+                    "keywordOper": "or",
+                    "lang": "eng",
+                    "dateStart": from_date.strftime("%Y-%m-%d"),
+                    "dateEnd": to_date.strftime("%Y-%m-%d"),
+                    "articlesSortBy": "date",
+                    "articlesCount": 30,
+                    "resultType": "articles",
                 })
-            
-            print(f"✅ Found {len(news_list)} general market news articles")
-            return news_list
-            
-        except Exception as e:
-            print(f"❌ Error fetching market news: {e}")
-            return []
-    
+                results = (data.get("articles") or {}).get("results", [])
+                for a in results:
+                    url = a.get("url", "")
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    item = self._normalize(a, symbol=None)
+                    item.pop("content", None)
+                    news_list.append(item)
+            except Exception as eq:
+                label = ", ".join(keywords)[:40]
+                print(f"   ⚠️  Bucket '{label}...' failed: {eq}")
+                continue
+
+        print(f"✅ Found {len(news_list)} general market news articles (multi-query)")
+        return news_list
+
     def save_news(self, news_list):
-        """Save news articles to database"""
+        """Save news articles to database."""
         saved_count = 0
-        
         for article in news_list:
             success = self.db.save_news(
-                symbol=article.get('symbol'),
-                title=article['title'],
-                description=article.get('description', ''),
-                url=article['url'],
-                source=article['source'],
-                published_at=article['published_at'],
-                sentiment_score=0
+                symbol=article.get("symbol"),
+                title=article["title"],
+                description=article.get("description", ""),
+                url=article["url"],
+                source=article["source"],
+                published_at=article["published_at"],
+                sentiment_score=0,
             )
             if success:
                 saved_count += 1
-        
         print(f"✅ Saved {saved_count} news articles to database")
         return saved_count
