@@ -445,15 +445,426 @@ def score_volatility(df, latest):
     return max(0, min(100, round(score))), signals
 
 
+def score_statistical(df, latest):
+    """Score statistical/probability signals (0-100).
+    Z-Score mean reversion, Linear Regression quality, Hurst exponent."""
+    bullish_pts = 0.0
+    bearish_pts = 0.0
+    signals = []
+
+    # --- Z-Score mean reversion (up to 25 pts) ---
+    zscore = safe_float(latest.get('ZScore', 0))
+    if zscore != 0:
+        if zscore <= -2.0:
+            bullish_pts += 25
+            signals.append(f"Z-Score {zscore:.2f} — deeply oversold (>2σ below mean), high reversion probability")
+        elif zscore <= -1.5:
+            bullish_pts += 18
+            signals.append(f"Z-Score {zscore:.2f} — oversold, mean reversion likely")
+        elif zscore <= -1.0:
+            bullish_pts += 10
+            signals.append(f"Z-Score {zscore:.2f} — below mean")
+        elif zscore <= -0.5:
+            bullish_pts += 4
+        elif zscore >= 2.0:
+            bearish_pts += 25
+            signals.append(f"Z-Score {zscore:.2f} — deeply overbought (>2σ above mean), reversion risk high")
+        elif zscore >= 1.5:
+            bearish_pts += 18
+            signals.append(f"Z-Score {zscore:.2f} — overbought, pullback likely")
+        elif zscore >= 1.0:
+            bearish_pts += 10
+            signals.append(f"Z-Score {zscore:.2f} — extended above mean")
+        elif zscore >= 0.5:
+            bearish_pts += 4
+        else:
+            # Near mean — balanced
+            bullish_pts += 2
+            bearish_pts += 2
+
+    # --- Linear Regression R² + Slope (up to 25 pts) ---
+    slope = safe_float(latest.get('LinReg_Slope', 0))
+    r2 = safe_float(latest.get('LinReg_R2', 0))
+    price = safe_float(latest['close'])
+
+    if r2 > 0 and price > 0:
+        # Normalize slope as daily % change
+        slope_pct = (slope / price) * 100
+
+        if r2 >= 0.8:
+            # High confidence trend
+            if slope_pct > 0.2:
+                bullish_pts += 25
+                signals.append(f"Strong uptrend (R²={r2:.2f}, +{slope_pct:.2f}%/day) — high statistical confidence")
+            elif slope_pct > 0.05:
+                bullish_pts += 16
+                signals.append(f"Steady uptrend (R²={r2:.2f}) — reliable trend")
+            elif slope_pct < -0.2:
+                bearish_pts += 25
+                signals.append(f"Strong downtrend (R²={r2:.2f}, {slope_pct:.2f}%/day) — high statistical confidence")
+            elif slope_pct < -0.05:
+                bearish_pts += 16
+                signals.append(f"Steady downtrend (R²={r2:.2f}) — reliable trend")
+            else:
+                bullish_pts += 3
+                bearish_pts += 3
+                signals.append(f"Flat trend with high R²={r2:.2f} — range-bound")
+        elif r2 >= 0.5:
+            # Moderate confidence
+            if slope_pct > 0.1:
+                bullish_pts += 12
+                signals.append(f"Moderate uptrend (R²={r2:.2f})")
+            elif slope_pct < -0.1:
+                bearish_pts += 12
+                signals.append(f"Moderate downtrend (R²={r2:.2f})")
+            else:
+                bullish_pts += 2
+                bearish_pts += 2
+        else:
+            # Low R² — noisy, no reliable trend
+            bearish_pts += 5
+            signals.append(f"Low trend reliability (R²={r2:.2f}) — choppy price action")
+
+    # --- Hurst Exponent (up to 15 pts — amplifier/modifier) ---
+    hurst = safe_float(latest.get('Hurst', 0))
+    if hurst > 0:
+        if hurst > 0.65:
+            # Strong trending behavior — amplify trend signals
+            if bullish_pts > bearish_pts:
+                bullish_pts += 15
+                signals.append(f"Hurst {hurst:.2f} — strong trending regime, trend signals are reliable")
+            elif bearish_pts > bullish_pts:
+                bearish_pts += 15
+                signals.append(f"Hurst {hurst:.2f} — strong trending regime, downtrend likely to persist")
+            else:
+                bullish_pts += 5
+                bearish_pts += 5
+        elif hurst > 0.55:
+            signals.append(f"Hurst {hurst:.2f} — mild trending tendency")
+            if bullish_pts > bearish_pts:
+                bullish_pts += 6
+            elif bearish_pts > bullish_pts:
+                bearish_pts += 6
+        elif hurst < 0.35:
+            # Mean-reverting — boost Z-score reversal signals
+            signals.append(f"Hurst {hurst:.2f} — mean-reverting regime, reversals are more likely")
+            if zscore <= -1.0:
+                bullish_pts += 12
+                signals.append("Mean-reversion regime + oversold Z-Score — high bounce probability")
+            elif zscore >= 1.0:
+                bearish_pts += 12
+                signals.append("Mean-reversion regime + overbought Z-Score — high pullback probability")
+        elif hurst < 0.45:
+            signals.append(f"Hurst {hurst:.2f} — mild mean-reverting tendency")
+        else:
+            signals.append(f"Hurst {hurst:.2f} — near random walk")
+
+    # Convert to 0-100
+    total = bullish_pts + bearish_pts
+    if total == 0:
+        score = 50
+    else:
+        score = (bullish_pts / total) * 100
+
+    return max(0, min(100, round(score))), signals
+
+
+def score_institutional(df, latest):
+    """Score institutional-grade signals (0-100).
+    VWAP, Relative Strength vs SPY, Ichimoku Cloud, Fibonacci levels."""
+    bullish_pts = 0.0
+    bearish_pts = 0.0
+    signals = []
+    price = safe_float(latest['close'])
+    if price <= 0:
+        return 50, ["No price data"]
+
+    # --- VWAP (up to 18 pts) ---
+    vwap_20 = safe_float(latest.get('VWAP_20', 0))
+    if vwap_20 > 0:
+        vwap_pct = ((price - vwap_20) / vwap_20) * 100
+        if vwap_pct > 5:
+            bullish_pts += 18
+            signals.append(f"Price {vwap_pct:.1f}% above 20d VWAP — strong institutional buying")
+        elif vwap_pct > 1:
+            bullish_pts += 10
+            signals.append(f"Price above 20d VWAP — buyers in control")
+        elif vwap_pct > -1:
+            bullish_pts += 3
+            bearish_pts += 3
+        elif vwap_pct > -5:
+            bearish_pts += 10
+            signals.append(f"Price below 20d VWAP — sellers in control")
+        else:
+            bearish_pts += 18
+            signals.append(f"Price {abs(vwap_pct):.1f}% below 20d VWAP — heavy institutional selling")
+
+    # --- Relative Strength vs SPY (up to 14 pts — reduced to make room for sector RS) ---
+    rs_20 = safe_float(latest.get('RS_SPY_20', 0))
+    rs_50 = safe_float(latest.get('RS_SPY_50', 0))
+    if rs_20 != 0 or rs_50 != 0:
+        if rs_20 > 10:
+            bullish_pts += 8
+            signals.append(f"Outperforming SPY by {rs_20:.1f}pp over 20d")
+        elif rs_20 > 3:
+            bullish_pts += 4
+        elif rs_20 < -10:
+            bearish_pts += 8
+            signals.append(f"Underperforming SPY by {abs(rs_20):.1f}pp over 20d")
+        elif rs_20 < -3:
+            bearish_pts += 4
+
+        if rs_50 > 5 and rs_20 > 3:
+            bullish_pts += 6
+            signals.append("Sustained outperformance vs market")
+        elif rs_50 < -5 and rs_20 < -3:
+            bearish_pts += 6
+            signals.append("Sustained underperformance vs market")
+
+    # --- Relative Strength vs SECTOR ETF (up to 14 pts) ---
+    # A stock can beat SPY while lagging its own sector — that's a relative-weakness
+    # signal SPY-only RS misses. Catches things like a semi underperforming XLK
+    # during a tech-led rally, which is a sell, not a buy.
+    rs_sec_20 = safe_float(latest.get('RS_SECTOR_20', 0))
+    rs_sec_50 = safe_float(latest.get('RS_SECTOR_50', 0))
+    if rs_sec_20 != 0 or rs_sec_50 != 0:
+        if rs_sec_20 > 10:
+            bullish_pts += 8
+            signals.append(f"Outperforming sector by {rs_sec_20:.1f}pp over 20d — sector leader")
+        elif rs_sec_20 > 3:
+            bullish_pts += 4
+            signals.append("Outperforming sector over 20d")
+        elif rs_sec_20 < -10:
+            bearish_pts += 8
+            signals.append(f"Underperforming sector by {abs(rs_sec_20):.1f}pp over 20d — sector laggard")
+        elif rs_sec_20 < -3:
+            bearish_pts += 4
+            signals.append("Underperforming sector over 20d")
+
+        if rs_sec_50 > 5 and rs_sec_20 > 3:
+            bullish_pts += 6
+            signals.append("Sustained sector outperformance — institutional accumulation in sector leaders")
+        elif rs_sec_50 < -5 and rs_sec_20 < -3:
+            bearish_pts += 6
+            signals.append("Sustained sector underperformance — rotating out")
+
+        # Divergence flag: beating SPY but losing to sector = misleading bullish RS
+        if rs_20 > 3 and rs_sec_20 < -3:
+            bearish_pts += 4
+            signals.append("Beats SPY but lags sector — false relative strength")
+
+    # --- Ichimoku Cloud (up to 22 pts) ---
+    tenkan = safe_float(latest.get('Ichi_Tenkan', 0))
+    kijun = safe_float(latest.get('Ichi_Kijun', 0))
+    senkou_a = safe_float(latest.get('Ichi_SenkouA', 0))
+    senkou_b = safe_float(latest.get('Ichi_SenkouB', 0))
+
+    if tenkan > 0 and kijun > 0:
+        cloud_top = max(senkou_a, senkou_b)
+        cloud_bottom = min(senkou_a, senkou_b)
+
+        # Price vs Cloud
+        if cloud_top > 0 and cloud_bottom > 0:
+            if price > cloud_top:
+                bullish_pts += 10
+                signals.append("Price above Ichimoku Cloud — bullish territory")
+            elif price < cloud_bottom:
+                bearish_pts += 10
+                signals.append("Price below Ichimoku Cloud — bearish territory")
+            else:
+                bullish_pts += 2
+                bearish_pts += 2
+                signals.append("Price inside Ichimoku Cloud — indecision zone")
+
+        # Tenkan/Kijun cross
+        if tenkan > kijun:
+            bullish_pts += 7
+            if len(df) >= 2:
+                prev_tenkan = safe_float(df.iloc[-2].get('Ichi_Tenkan', 0))
+                prev_kijun = safe_float(df.iloc[-2].get('Ichi_Kijun', 0))
+                if prev_tenkan > 0 and prev_kijun > 0 and prev_tenkan <= prev_kijun:
+                    bullish_pts += 5
+                    signals.append("Ichimoku TK Cross bullish — fresh buy signal")
+        elif kijun > tenkan:
+            bearish_pts += 7
+            if len(df) >= 2:
+                prev_tenkan = safe_float(df.iloc[-2].get('Ichi_Tenkan', 0))
+                prev_kijun = safe_float(df.iloc[-2].get('Ichi_Kijun', 0))
+                if prev_tenkan > 0 and prev_kijun > 0 and prev_tenkan >= prev_kijun:
+                    bearish_pts += 5
+                    signals.append("Ichimoku TK Cross bearish — fresh sell signal")
+
+        # Cloud color (future trend)
+        if senkou_a > senkou_b:
+            bullish_pts += 3
+        elif senkou_b > senkou_a:
+            bearish_pts += 3
+
+    # --- Fibonacci Levels (up to 15 pts) ---
+    fib_382 = safe_float(latest.get('Fib_382', 0))
+    fib_500 = safe_float(latest.get('Fib_500', 0))
+    fib_618 = safe_float(latest.get('Fib_618', 0))
+    fib_0 = safe_float(latest.get('Fib_0', 0))
+    fib_1 = safe_float(latest.get('Fib_1', 0))
+
+    if fib_0 > 0 and fib_1 > fib_0:
+        fib_range = fib_1 - fib_0
+        tolerance = fib_range * 0.02  # 2% tolerance for "near" a level
+
+        if abs(price - fib_618) < tolerance:
+            bullish_pts += 10
+            signals.append(f"Price at 61.8% Fibonacci support (${fib_618:.2f}) — golden ratio bounce zone")
+        elif abs(price - fib_500) < tolerance:
+            bullish_pts += 7
+            signals.append(f"Price at 50% Fibonacci retracement (${fib_500:.2f})")
+        elif abs(price - fib_382) < tolerance:
+            bullish_pts += 5
+            signals.append(f"Price at 38.2% Fibonacci level (${fib_382:.2f}) — shallow pullback support")
+
+        # Near swing high = resistance
+        if abs(price - fib_1) < tolerance:
+            bearish_pts += 8
+            signals.append(f"Price at Fibonacci swing high (${fib_1:.2f}) — resistance zone")
+        # Near swing low = deep support
+        elif abs(price - fib_0) < tolerance:
+            bullish_pts += 12
+            signals.append(f"Price at Fibonacci swing low (${fib_0:.2f}) — deep support")
+
+        # Position in Fibonacci range for general bias
+        fib_pos = (price - fib_0) / fib_range if fib_range > 0 else 0.5
+        if fib_pos < 0.3:
+            bullish_pts += 5
+            signals.append(f"Price in lower 30% of Fibonacci range — near support")
+        elif fib_pos > 0.85:
+            bearish_pts += 5
+            signals.append(f"Price in upper 15% of Fibonacci range — near resistance")
+
+    # --- Chaikin Money Flow (up to 15 pts) ---
+    cmf = safe_float(latest.get('CMF', 0))
+    if cmf != 0:
+        if cmf > 0.15:
+            bullish_pts += 15
+            signals.append(f"CMF {cmf:.3f} — strong buying pressure (smart money accumulating)")
+        elif cmf > 0.05:
+            bullish_pts += 8
+            signals.append(f"CMF {cmf:.3f} — positive money flow")
+        elif cmf > -0.05:
+            bullish_pts += 2
+            bearish_pts += 2
+        elif cmf > -0.15:
+            bearish_pts += 8
+            signals.append(f"CMF {cmf:.3f} — negative money flow")
+        else:
+            bearish_pts += 15
+            signals.append(f"CMF {cmf:.3f} — strong selling pressure (smart money distributing)")
+
+    # Convert to 0-100
+    total = bullish_pts + bearish_pts
+    if total == 0:
+        score = 50
+    else:
+        score = (bullish_pts / total) * 100
+
+    return max(0, min(100, round(score))), signals
+
+
+def score_setup_winrate(df, latest, prev):
+    """Score based on historical pattern win rate (0-100).
+    Backtests current indicator setup against past occurrences in the data."""
+    signals = []
+    price = safe_float(latest['close'])
+    if price <= 0 or len(df) < 60:
+        return 50, ["Insufficient history for pattern backtesting"]
+
+    # Define the current "setup" using key indicator states
+    rsi = safe_float(latest.get('RSI', 50))
+    macd_hist = safe_float(latest.get('MACD_Histogram', 0))
+    above_sma50 = price > safe_float(latest.get('SMA_50', 0)) if safe_float(latest.get('SMA_50', 0)) > 0 else None
+
+    # Backtest: find past bars with similar conditions and check what happened next
+    wins_5d = 0
+    losses_5d = 0
+    wins_10d = 0
+    losses_10d = 0
+    total_setups = 0
+
+    # RSI zone matching
+    rsi_low = rsi - 7
+    rsi_high = rsi + 7
+
+    for i in range(50, len(df) - 11):  # Need 10 days forward to measure outcome
+        row = df.iloc[i]
+        row_rsi = safe_float(row.get('RSI', 0))
+        row_macd_hist = safe_float(row.get('MACD_Histogram', 0))
+        row_price = safe_float(row['close'])
+        row_sma50 = safe_float(row.get('SMA_50', 0))
+
+        if row_rsi <= 0 or row_price <= 0:
+            continue
+
+        # Match conditions: similar RSI zone + same MACD sign + same SMA50 side
+        rsi_match = rsi_low <= row_rsi <= rsi_high
+        macd_match = (macd_hist > 0 and row_macd_hist > 0) or (macd_hist <= 0 and row_macd_hist <= 0)
+        sma_match = True
+        if above_sma50 is not None and row_sma50 > 0:
+            sma_match = (row_price > row_sma50) == above_sma50
+
+        if rsi_match and macd_match and sma_match:
+            total_setups += 1
+            # 5-day outcome
+            future_5 = safe_float(df.iloc[i + 5]['close'])
+            if future_5 > row_price:
+                wins_5d += 1
+            else:
+                losses_5d += 1
+            # 10-day outcome
+            future_10 = safe_float(df.iloc[i + 10]['close'])
+            if future_10 > row_price:
+                wins_10d += 1
+            else:
+                losses_10d += 1
+
+    if total_setups < 5:
+        return 50, [f"Only {total_setups} similar historical setups — insufficient for probability estimate"]
+
+    winrate_5d = (wins_5d / total_setups) * 100
+    winrate_10d = (wins_10d / total_setups) * 100
+
+    # Average the two timeframes
+    avg_winrate = (winrate_5d + winrate_10d) / 2
+
+    # Convert win rate to score: 50% = neutral, >65% = bullish, <35% = bearish
+    # Scale: 50% winrate = 50 score, 80% = ~90, 20% = ~10
+    score = avg_winrate  # Direct mapping since winrate is already 0-100
+
+    signals.append(f"Historical win rate: {winrate_5d:.0f}% (5d) / {winrate_10d:.0f}% (10d) from {total_setups} similar setups")
+
+    if avg_winrate >= 70:
+        signals.append(f"High-probability bullish setup — {avg_winrate:.0f}% historical success rate")
+    elif avg_winrate >= 60:
+        signals.append(f"Favorable odds — {avg_winrate:.0f}% historical success rate")
+    elif avg_winrate <= 30:
+        signals.append(f"High-probability bearish setup — only {avg_winrate:.0f}% historically went up")
+    elif avg_winrate <= 40:
+        signals.append(f"Unfavorable odds — only {avg_winrate:.0f}% historical success rate")
+
+    return max(0, min(100, round(score))), signals
+
+
 def calculate_technical_score(df):
     """
     Master function: calculates the composite technical score.
     Returns dict with score, sub-scores, and key_signals.
+
+    Weights:
+      Trend 20%, Momentum 20%, Volume 12%, Volatility 12%,
+      Statistical 16%, Institutional 12%, Win Rate 8%
     """
     if df is None or df.empty or len(df) < 2:
         return {
             'score': 50,
             'trend': 50, 'momentum': 50, 'volume': 50, 'volatility': 50,
+            'statistical': 50, 'institutional': 50, 'winrate': 50,
             'key_signals': ['Insufficient data for technical analysis'],
         }
 
@@ -464,18 +875,28 @@ def calculate_technical_score(df):
     momentum_score, momentum_signals = score_momentum(df, latest, prev)
     volume_score, volume_signals = score_volume(df, latest)
     volatility_score, volatility_signals = score_volatility(df, latest)
+    statistical_score, statistical_signals = score_statistical(df, latest)
+    institutional_score, institutional_signals = score_institutional(df, latest)
+    winrate_score, winrate_signals = score_setup_winrate(df, latest, prev)
 
-    # Weighted composite: Trend 30%, Momentum 30%, Volume 20%, Volatility 20%
+    # Weighted composite
     composite = (
-        trend_score * 0.30
-        + momentum_score * 0.30
-        + volume_score * 0.20
-        + volatility_score * 0.20
+        trend_score * 0.20
+        + momentum_score * 0.20
+        + volume_score * 0.12
+        + volatility_score * 0.12
+        + statistical_score * 0.16
+        + institutional_score * 0.12
+        + winrate_score * 0.08
     )
     composite = max(0, min(100, round(composite)))
 
     # Collect top signals (most impactful)
-    all_signals = trend_signals + momentum_signals + volume_signals + volatility_signals
+    all_signals = (
+        trend_signals + momentum_signals + statistical_signals
+        + institutional_signals + winrate_signals
+        + volume_signals + volatility_signals
+    )
 
     return {
         'score': composite,
@@ -483,5 +904,8 @@ def calculate_technical_score(df):
         'momentum': momentum_score,
         'volume': volume_score,
         'volatility': volatility_score,
-        'key_signals': all_signals[:8],  # Top 8 signals
+        'statistical': statistical_score,
+        'institutional': institutional_score,
+        'winrate': winrate_score,
+        'key_signals': all_signals[:12],  # Top 12 signals
     }

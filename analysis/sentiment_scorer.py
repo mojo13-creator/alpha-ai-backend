@@ -2,9 +2,17 @@
 """
 Programmatic Sentiment Score Calculator (0-100)
 Sources: NewsAPI headlines, Reddit mentions, Finviz analyst consensus.
+
+Headline classification uses Claude Haiku in a single batched call per analysis
+(~$0.0007/call). Falls back to keyword bag if the API is unavailable. The
+keyword approach scored "Apple beats antitrust probe" as bullish — we replaced
+it because that's a structural error, not a tuning issue.
 """
 
+import json
 import math
+import os
+import re
 from datetime import datetime
 
 
@@ -34,7 +42,7 @@ BEARISH_WORDS = [
 
 
 def _score_headline(text):
-    """Score a single headline. Returns -1 to +1."""
+    """Keyword-bag fallback. Returns -1 to +1. Use _classify_headlines_ai when possible."""
     if not text:
         return 0
     text_lower = text.lower()
@@ -46,21 +54,87 @@ def _score_headline(text):
     return (bull - bear) / total
 
 
-def score_news_sentiment(news_articles):
+def _classify_headlines_ai(headlines, symbol):
+    """
+    Batch-classify headlines via Claude Haiku. Returns list of floats in [-1, 1]
+    aligned to the input order, or None on any failure (caller falls back to
+    keyword bag). One API call per analysis.
+
+    Each headline is scored for sentiment AS IT RELATES TO THE TICKER. So
+    "AMZN beats antitrust probe" is bullish for AMZN, "AMZN sued by FTC" is
+    bearish. The keyword bag couldn't tell those apart.
+    """
+    if not headlines:
+        return []
+
+    try:
+        import config
+        import anthropic
+    except Exception:
+        return None
+
+    api_key = getattr(config, 'CLAUDE_API_KEY', None) or os.environ.get('CLAUDE_API_KEY')
+    if not api_key:
+        return None
+
+    # Build a numbered list — Haiku returns a parallel array
+    numbered = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
+    prompt = (
+        f"For each headline below, score its sentiment FOR THE TICKER {symbol} "
+        f"on a scale from -1.0 (very bearish for {symbol}) to +1.0 (very bullish "
+        f"for {symbol}). 0.0 = neutral or unrelated.\n\n"
+        f"Critical: judge by impact on {symbol}, not by tone. "
+        f"\"{symbol} beats lawsuit\" is BULLISH (legal overhang removed). "
+        f"\"{symbol} cuts forecast\" is BEARISH even without negative words. "
+        f"Headlines about competitors, the broader market, or macro should be "
+        f"scored small (|score| <= 0.3) unless the impact on {symbol} is direct.\n\n"
+        f"Headlines:\n{numbered}\n\n"
+        f"Respond with ONLY a JSON array of {len(headlines)} numbers in the same "
+        f"order, no prose, no markdown. Example: [0.8, -0.4, 0.0, 0.2]"
+    )
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = message.content[0].text.strip()
+        # Strip optional markdown fences
+        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.MULTILINE).strip()
+        scores = json.loads(text)
+        if not isinstance(scores, list) or len(scores) != len(headlines):
+            return None
+        # Clamp to [-1, 1] and coerce to float
+        return [max(-1.0, min(1.0, float(s))) for s in scores]
+    except Exception as e:
+        print(f"  ⚠️  Haiku headline classification failed: {e} — falling back to keyword bag")
+        return None
+
+
+def score_news_sentiment(news_articles, symbol=None):
     """
     Score sentiment from news headlines (0-100).
     news_articles: list of dicts with 'title', 'description', 'published_at' keys.
+    symbol: ticker — required for AI classification (without it, falls back to keyword bag).
     """
     if not news_articles:
         return 50, [], 'neutral'
 
-    scores = []
-    for article in news_articles[:20]:  # Cap at 20
-        title = article.get('title', '')
-        desc = article.get('description', '')
-        text = f"{title} {desc}"
-        s = _score_headline(text)
-        scores.append(s)
+    capped = news_articles[:20]
+    texts = [f"{a.get('title', '')} {a.get('description', '')}".strip() for a in capped]
+
+    scores = None
+    classifier = 'keyword'
+    if symbol:
+        ai_scores = _classify_headlines_ai(texts, symbol)
+        if ai_scores is not None:
+            scores = ai_scores
+            classifier = 'ai'
+
+    if scores is None:
+        scores = [_score_headline(t) for t in texts]
 
     if not scores:
         return 50, [], 'neutral'
@@ -76,6 +150,8 @@ def score_news_sentiment(news_articles):
     neutral_count = len(scores) - bullish_count - bearish_count
 
     signals = []
+    if classifier == 'ai':
+        signals.append(f'AI-classified {len(scores)} headlines (avg {avg_sentiment:+.2f})')
     if bullish_count > bearish_count * 2:
         label = 'bullish'
         signals.append(f'{bullish_count} bullish vs {bearish_count} bearish headlines')
@@ -278,7 +354,7 @@ def calculate_sentiment_score(news_articles, reddit_scraper=None, symbol='',
     Returns dict with score, sub-components, and key_signals.
     """
     # News: 50% weight
-    news_score, news_signals, news_label = score_news_sentiment(news_articles)
+    news_score, news_signals, news_label = score_news_sentiment(news_articles, symbol=symbol)
 
     # Reddit: 25% weight
     if reddit_scraper:
