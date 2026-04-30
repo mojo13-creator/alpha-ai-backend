@@ -18,6 +18,7 @@ from analysis.sentiment_scorer import calculate_sentiment_score
 from analysis.ai_analyzer import AIStockAnalyzer
 from analysis.gemini_analyzer import GeminiAnalyzer
 from analysis.chatgpt_analyzer import ChatGPTAnalyzer
+from analysis.market_regime import get_market_regime, apply_regime_to_signal
 
 
 def safe_float(val, default=0.0):
@@ -26,6 +27,49 @@ def safe_float(val, default=0.0):
         return default if math.isnan(v) or math.isinf(v) else v
     except Exception:
         return default
+
+
+def stretch_score(raw, strength=1.5, agreement=1.0):
+    """
+    Expand scores away from 50 to use the full 0-100 range.
+    Sub-scorers tend to compress into 35-65 because they use bullish/(bullish+bearish)
+    ratios or additive ± adjustments from a 50 base. This applies a power-curve contrast
+    stretch that keeps 50 neutral but pushes conviction scores toward the extremes.
+
+    `agreement` (0.0–1.0) gates the stretch: 1.0 = full stretch, 0.0 = no stretch
+    (returns raw). Validation showed un-gated stretching pushed weak setups past
+    STRONG_BUY thresholds, inflating HIGH confidence on calls that didn't pan out.
+    Pass agreement based on sub-score spread (low spread = high agreement).
+    """
+    raw = max(0, min(100, raw))
+    if agreement <= 0:
+        return raw
+    normalized = (raw - 50) / 50  # -1 to +1
+    sign = 1 if normalized >= 0 else -1
+    full_stretched = sign * (abs(normalized) ** (1 / strength))
+    # Blend between raw (agreement=0) and full stretched (agreement=1)
+    blended = normalized * (1 - agreement) + full_stretched * agreement
+    return max(0, min(100, round(50 + blended * 50)))
+
+
+def _agreement_factor(sub_scores):
+    """
+    Map sub-score spread → agreement factor in [0, 1].
+    Low spread (subs aligned) → high agreement → full stretch allowed.
+    High spread (subs disagree) → low agreement → preserve raw scores.
+
+      spread <= 10  → 1.00 (full stretch)
+      spread == 25  → 0.50
+      spread >= 40  → 0.00 (no stretch)
+    """
+    if not sub_scores:
+        return 0.5
+    spread = max(sub_scores) - min(sub_scores)
+    if spread <= 10:
+        return 1.0
+    if spread >= 40:
+        return 0.0
+    return max(0.0, min(1.0, (40 - spread) / 30))
 
 
 # Weight profiles by market cap category
@@ -44,43 +88,43 @@ def determine_signal(composite_score, tech_score, fund_score, sent_score, ai_sco
     """
     Determine actionable signal based on composite + sub-score alignment.
     Returns (signal, confidence, risk_level).
+    Thresholds are calibrated for stretch_score() expanded ranges.
     """
     sub_scores = [tech_score, fund_score, sent_score, ai_score]
-    above_75 = sum(1 for s in sub_scores if s >= 75)
+    above_70 = sum(1 for s in sub_scores if s >= 70)
     above_60 = sum(1 for s in sub_scores if s >= 60)
-    below_25 = sum(1 for s in sub_scores if s <= 25)
+    below_30 = sum(1 for s in sub_scores if s <= 30)
     below_40 = sum(1 for s in sub_scores if s <= 40)
     any_below_20 = any(s < 20 for s in sub_scores)
 
     # Score spread = alignment indicator
     spread = max(sub_scores) - min(sub_scores)
 
-    if composite_score >= 85 and above_75 >= 3:
+    if composite_score >= 78 and above_70 >= 3:
         signal = 'STRONG_BUY'
-    elif composite_score >= 70 and not any(s < 40 for s in sub_scores):
+    elif composite_score >= 65 and above_60 >= 3:
         signal = 'BUY'
-    elif composite_score <= 25 and tech_score < 35:
-        # Confirm downtrend for SHORT
+    elif composite_score <= 22 and tech_score < 30:
         signal = 'SHORT'
-    elif composite_score < 30 or below_25 >= 2:
+    elif composite_score < 28 or below_30 >= 3:
         signal = 'STRONG_SELL'
-    elif composite_score < 50 or any_below_20:
+    elif composite_score < 42 or (below_40 >= 2 and any_below_20):
         signal = 'SELL'
     else:
         signal = 'HOLD'
 
     # Confidence based on sub-score alignment
-    if spread < 15:
+    if spread < 18:
         confidence = 'HIGH'
-    elif spread < 30:
+    elif spread < 35:
         confidence = 'MODERATE'
     else:
         confidence = 'LOW'
 
     # Risk level
-    if spread > 40 or any_below_20:
+    if spread > 45 or any_below_20:
         risk_level = 'HIGH'
-    elif spread > 25 or below_40 >= 1:
+    elif spread > 30 or below_40 >= 1:
         risk_level = 'MODERATE'
     else:
         risk_level = 'LOW'
@@ -155,6 +199,33 @@ def calculate_action(signal, price, atr, df=None):
         'time_horizon': time_horizon,
         'risk_reward_ratio': f'{rr}:1',
     }
+
+
+def _check_earnings_window(ticker_obj, days_window=5):
+    """
+    Returns (days_until_earnings, earnings_date_iso) or (None, None) if no
+    upcoming earnings found within the window. Holding through earnings is
+    a different risk profile than a normal swing — system should flag it.
+    """
+    try:
+        ed = ticker_obj.earnings_dates
+        if ed is None or ed.empty:
+            return None, None
+        # Index is dates; some are future, some past. Get future ones.
+        from datetime import datetime
+        now = datetime.now()
+        # Strip timezone for comparison
+        future = [d for d in ed.index if (d.to_pydatetime().replace(tzinfo=None) >= now)]
+        if not future:
+            return None, None
+        next_ed = min(future)
+        next_ed_naive = next_ed.to_pydatetime().replace(tzinfo=None)
+        delta_days = (next_ed_naive - now).days
+        if 0 <= delta_days <= days_window:
+            return delta_days, next_ed_naive.isoformat()
+        return None, None
+    except Exception:
+        return None, None
 
 
 def _signal_direction(signal):
@@ -294,44 +365,68 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
     except Exception:
         stock_info = {}
 
-    # 2b. Berkeley enrichment (best-effort, non-blocking)
+    # 2b. Start Berkeley + SEC EDGAR enrichment in background while we do other work
+    import concurrent.futures
     berkeley_data = {}
     berkeley_sources_available = []
     berkeley_sources_failed = []
+    berkeley_future = None
+    sec_data = {}
+    sec_future = None
+
     if use_berkeley:
-        print(f"\n🏛️  Phase 0: Berkeley Enrichment...")
+        print(f"\n🏛️  Starting Berkeley enrichment in background...")
         try:
             from data_collection.berkeley.enrichment_manager import BerkeleyEnrichmentManager
             enrichment = BerkeleyEnrichmentManager()
-
-            # Run async enrichment from sync context
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        berkeley_data = pool.submit(
-                            asyncio.run, enrichment.enrich(symbol)
-                        ).result(timeout=120)
-                else:
-                    berkeley_data = loop.run_until_complete(enrichment.enrich(symbol))
-            except RuntimeError:
-                berkeley_data = asyncio.run(enrichment.enrich(symbol))
-
-            berkeley_sources_available = list(berkeley_data.keys())
-            all_berkeley = ["capital_iq", "wrds", "ibisworld", "fitch", "orbis", "finaeon", "statista"]
-            berkeley_sources_failed = [s for s in all_berkeley if s not in berkeley_sources_available]
-            print(f"  Berkeley sources: {berkeley_sources_available or 'none'}")
+            _berkeley_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            berkeley_future = _berkeley_pool.submit(asyncio.run, enrichment.enrich(symbol))
         except Exception as e:
             print(f"  ⚠️  Berkeley enrichment unavailable: {e}")
 
-    # 3. Technical Score
+    # SEC EDGAR — always runs (free, no API key needed)
+    print(f"📋 Starting SEC EDGAR fetch in background...")
+    try:
+        from data_collection.sec_edgar import SECEdgarScraper
+        _sec_scraper = SECEdgarScraper()
+        _sec_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        sec_future = _sec_pool.submit(_sec_scraper.get_edgar_data, symbol)
+    except Exception as e:
+        print(f"  ⚠️  SEC EDGAR unavailable: {e}")
+
+    # 3. Technical Score (runs while Berkeley is fetching in background)
     tech_result = calculate_technical_score(df)
     print(f"  Technical Score: {tech_result['score']}/100")
 
-    # 4. Fundamental Score (enhanced with Berkeley data if available)
-    print(f"\n📊 Phase 2: Fundamental Analysis...")
-    fund_result = calculate_fundamental_score(symbol, berkeley_data=berkeley_data or None)
+    # 4. News fetch (runs while Berkeley is still fetching)
+    print(f"\n📊 Phase 2: Fundamental + Sentiment Analysis...")
+    news_articles = []
+    try:
+        news_articles = news_scraper.fetch_stock_news(symbol, days=7) or []
+    except Exception:
+        pass
+
+    # 5. Collect Berkeley + SEC EDGAR results before fundamental scoring
+    if berkeley_future:
+        try:
+            berkeley_data = berkeley_future.result(timeout=30) or {}
+            berkeley_sources_available = list(berkeley_data.keys())
+            all_berkeley = ["capital_iq", "wrds", "ibisworld", "orbis", "statista"]
+            berkeley_sources_failed = [s for s in all_berkeley if s not in berkeley_sources_available]
+            print(f"  Berkeley sources: {berkeley_sources_available or 'none'}")
+        except Exception as e:
+            print(f"  ⚠️  Berkeley enrichment failed: {e}")
+
+    if sec_future:
+        try:
+            sec_data = sec_future.result(timeout=20) or {}
+            if sec_data:
+                print(f"  SEC EDGAR: {list(sec_data.keys())}")
+        except Exception as e:
+            print(f"  ⚠️  SEC EDGAR fetch failed: {e}")
+
+    # 6. Fundamental Score (enhanced with Berkeley + SEC EDGAR data if available)
+    fund_result = calculate_fundamental_score(symbol, berkeley_data=berkeley_data or None, sec_data=sec_data or None)
     print(f"  Fundamental Score: {fund_result['score']}/100")
     if fund_result.get('berkeley_enhanced'):
         print(f"  (Berkeley-enhanced from: {fund_result.get('berkeley_sources', [])})")
@@ -341,14 +436,7 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
     cap_cat = fund_result.get('market_cap_category', 'unknown')
     cap_label = fund_result.get('market_cap_label', 'Unknown')
 
-    # 5. Sentiment Score
-    print(f"\n📊 Phase 3: Sentiment Analysis...")
-    news_articles = []
-    try:
-        news_articles = news_scraper.fetch_stock_news(symbol, days=7) or []
-    except Exception:
-        pass
-
+    # 7. Sentiment Score
     sent_result = calculate_sentiment_score(
         news_articles=news_articles,
         reddit_scraper=reddit_scraper,
@@ -374,6 +462,7 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         news_headlines=news_articles[:8],
         df=df,
         berkeley_data=berkeley_data or None,
+        sec_data=sec_data or None,
         user_period=user_period,
     )
 
@@ -386,35 +475,49 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         }
         print(f"  AI Insight Score: SKIPPED")
     else:
-        # --- Claude ---
-        print(f"  Running Claude analysis...")
-        ai_analyzer = AIStockAnalyzer(db_manager, technical_analyzer, news_scraper)
-        claude_result = ai_analyzer.get_ai_insight_score(**ai_kwargs)
-        print(f"  Claude Score: {claude_result['score']}/100")
+        # --- Run all 3 AI models in parallel ---
+        import concurrent.futures
 
-        # --- Gemini ---
-        print(f"  Running Gemini analysis...")
-        try:
-            gemini_analyzer = GeminiAnalyzer()
-            gemini_result = gemini_analyzer.get_gemini_insight_score(**ai_kwargs)
+        def _run_claude():
+            ai_analyzer = AIStockAnalyzer(db_manager, technical_analyzer, news_scraper)
+            return ai_analyzer.get_ai_insight_score(**ai_kwargs)
+
+        def _run_gemini():
+            try:
+                gemini_analyzer = GeminiAnalyzer()
+                return gemini_analyzer.get_gemini_insight_score(**ai_kwargs)
+            except Exception as e:
+                print(f"  Gemini failed: {e}")
+                return None
+
+        def _run_chatgpt():
+            try:
+                chatgpt_analyzer = ChatGPTAnalyzer()
+                return chatgpt_analyzer.get_chatgpt_insight_score(**ai_kwargs)
+            except Exception as e:
+                print(f"  ChatGPT failed: {e}")
+                return None
+
+        print(f"  Running Claude + Gemini + ChatGPT in parallel...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            future_claude = executor.submit(_run_claude)
+            future_gemini = executor.submit(_run_gemini)
+            future_chatgpt = executor.submit(_run_chatgpt)
+
+            claude_result = future_claude.result(timeout=60)
+            print(f"  Claude Score: {claude_result['score']}/100")
+
+            gemini_result = future_gemini.result(timeout=60)
             if gemini_result:
                 print(f"  Gemini Score: {gemini_result['score']}/100")
             else:
                 print(f"  Gemini: unavailable")
-        except Exception as e:
-            print(f"  Gemini failed: {e}")
 
-        # --- ChatGPT ---
-        print(f"  Running ChatGPT analysis...")
-        try:
-            chatgpt_analyzer = ChatGPTAnalyzer()
-            chatgpt_result = chatgpt_analyzer.get_chatgpt_insight_score(**ai_kwargs)
+            chatgpt_result = future_chatgpt.result(timeout=60)
             if chatgpt_result:
                 print(f"  ChatGPT Score: {chatgpt_result['score']}/100")
             else:
                 print(f"  ChatGPT: unavailable")
-        except Exception as e:
-            print(f"  ChatGPT failed: {e}")
 
         # --- Combine scores (average all available models) ---
         ai_scores = [claude_result['score']]
@@ -432,22 +535,68 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         print(f"  Consensus: {multi_model['consensus']} ({multi_model.get('consensus_confidence', 'N/A')}, spread: {multi_model['score_spread']}, models: {multi_model.get('models_used', 0)})")
     print(f"  AI Insight Score (combined): {ai_result['score']}/100")
 
-    # 7. Composite Score with market-cap weighting
+    # 7. Stretch sub-scores to use full 0-100 range, then composite with market-cap weighting.
+    # Stretch is gated by sub-score agreement: when subs disagree (high spread),
+    # stretch shrinks toward 0 to preserve the low-conviction signal. This fixed the
+    # HIGH-confidence inversion the validator detected (HIGH calls were performing
+    # WORSE than MODERATE because un-gated stretching was pushing weak setups past
+    # STRONG_BUY thresholds).
     weights = WEIGHT_PROFILES.get(cap_cat, WEIGHT_PROFILES['unknown'])
 
+    raw_subs = [tech_result['score'], fund_result['score'],
+                sent_result['score'], ai_result['score']]
+    agreement = _agreement_factor(raw_subs)
+
+    tech_stretched = stretch_score(tech_result['score'], agreement=agreement)
+    fund_stretched = stretch_score(fund_result['score'], agreement=agreement)
+    sent_stretched = stretch_score(sent_result['score'], agreement=agreement)
+    ai_stretched = stretch_score(ai_result['score'], agreement=agreement)
+
+    print(f"  Sub-score spread: {max(raw_subs) - min(raw_subs)}, agreement: {agreement:.2f}")
+    print(f"  Stretched: Tech {tech_result['score']}→{tech_stretched}  Fund {fund_result['score']}→{fund_stretched}  Sent {sent_result['score']}→{sent_stretched}  AI {ai_result['score']}→{ai_stretched}")
+
     composite = (
-        tech_result['score'] * weights['technical']
-        + fund_result['score'] * weights['fundamental']
-        + sent_result['score'] * weights['sentiment']
-        + ai_result['score'] * weights['ai_insight']
+        tech_stretched * weights['technical']
+        + fund_stretched * weights['fundamental']
+        + sent_stretched * weights['sentiment']
+        + ai_stretched * weights['ai_insight']
     )
     composite = max(0, min(100, round(composite)))
 
-    # 8. Signal determination
+    # 8. Signal determination (uses stretched scores)
     signal, confidence, risk_level = determine_signal(
-        composite, tech_result['score'], fund_result['score'],
-        sent_result['score'], ai_result['score']
+        composite, tech_stretched, fund_stretched,
+        sent_stretched, ai_stretched
     )
+
+    # 8a. Earnings-window gate — downgrade confidence for any directional call
+    # within 5 trading days of earnings. Holding through earnings is a binary
+    # event bet, not a setup the system was scored on.
+    earnings_days, earnings_date = _check_earnings_window(ticker_obj, days_window=5)
+    earnings_warning = None
+    if earnings_days is not None and signal not in ('HOLD',):
+        earnings_warning = f"Earnings in {earnings_days} day(s) ({earnings_date[:10]}) — binary event risk"
+        if confidence == 'HIGH':
+            confidence = 'MODERATE'
+        elif confidence == 'MODERATE':
+            confidence = 'LOW'
+        # Boost risk one notch
+        if risk_level == 'LOW':
+            risk_level = 'MODERATE'
+        elif risk_level == 'MODERATE':
+            risk_level = 'HIGH'
+        print(f"  ⚠️  {earnings_warning} → confidence/risk adjusted")
+
+    # 8b. Regime gate — dampen counter-regime signals.
+    # Validator showed SELL signals had ~15% hit rate during a clear risk-on
+    # regime; STRONG_SELL was almost as bad. Without macro context the system
+    # was calling SELL right before stocks ripped. We downgrade such signals
+    # unless the conviction is overwhelming (composite < 15 for bears, > 85 for bulls).
+    regime = get_market_regime()
+    pre_regime_signal = signal
+    signal, regime_note = apply_regime_to_signal(signal, composite, regime)
+    if signal != pre_regime_signal:
+        print(f"  Regime ({regime['regime']}): {pre_regime_signal} → {signal}  [{regime_note}]")
 
     # Confidence boost from AI consensus
     confidence_tiers = ['LOW', 'MODERATE', 'HIGH']
@@ -459,28 +608,38 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         elif mc == 'DISAGREE':
             confidence = confidence_tiers[max(idx - 1, 0)]
 
-    # Confidence boost from Berkeley data breadth
+    # Berkeley source count is NOT a confidence signal — having more data sources
+    # doesn't mean the call is more correct. The previous "boost by source count"
+    # logic was a likely contributor to the HIGH-confidence inversion the validator
+    # found. Berkeley breadth now only boosts confidence when it reinforces existing
+    # agreement: at least 3 sources AND sub-scores already aligned (agreement >= 0.7)
+    # AND multi-model AI consensus is unanimous or directional.
     num_berkeley = len(berkeley_sources_available)
-    if num_berkeley >= 5 and confidence in confidence_tiers:
-        idx = confidence_tiers.index(confidence)
-        confidence = confidence_tiers[min(idx + 2, 2)]
-    elif num_berkeley >= 3 and confidence in confidence_tiers:
+    ai_agrees = bool(multi_model and multi_model.get('consensus') in ('UNANIMOUS', 'AGREE_DIRECTION'))
+    if (num_berkeley >= 3 and agreement >= 0.7 and ai_agrees
+            and confidence in confidence_tiers):
         idx = confidence_tiers.index(confidence)
         confidence = confidence_tiers[min(idx + 1, 2)]
 
     # 9. Action calculation (entry, stop, target)
     atr = safe_float(latest.get('ATR', 0))
-    # Use AI's action if available and reasonable, otherwise calculate from signal
-    if ai_result.get('entry_price', 0) > 0:
+    # Use AI's trade levels if available AND the AI direction matches the composite signal.
+    # If they disagree, fall back to calculate_action() which uses the composite signal.
+    ai_action_dir = _signal_direction(ai_result.get('action', ''))
+    composite_dir = _signal_direction(signal)
+
+    if (ai_result.get('entry_price', 0) > 0
+            and ai_action_dir == composite_dir
+            and composite_dir != 'neutral'):
         action = {
-            'recommendation': ai_result.get('action', signal.replace('_', ' ')),
+            'recommendation': signal.replace('_', ' '),
             'entry_price': ai_result['entry_price'],
             'stop_loss': ai_result['stop_loss'],
             'target_price': ai_result['target_price'],
             'time_horizon': ai_result.get('time_horizon', '2-4 weeks'),
             'risk_reward_ratio': '',
         }
-        # Calculate risk/reward
+        # Calculate risk/reward using the composite signal direction
         if action['stop_loss'] > 0 and action['target_price'] > 0:
             if signal in ('SHORT', 'STRONG_SELL', 'SELL'):
                 risk = action['stop_loss'] - action['entry_price']
@@ -531,10 +690,10 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         db_manager.save_analysis_history(
             ticker=symbol,
             composite_score=composite,
-            technical_score=tech_result['score'],
-            fundamental_score=fund_result['score'],
-            sentiment_score=sent_result['score'],
-            ai_insight_score=ai_result['score'],
+            technical_score=tech_stretched,
+            fundamental_score=fund_stretched,
+            sentiment_score=sent_stretched,
+            ai_insight_score=ai_stretched,
             signal=signal,
             confidence=confidence,
             risk_level=risk_level,
@@ -571,29 +730,36 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         'recommendation': action['recommendation'],
         'sub_scores': {
             'technical': {
-                'score': tech_result['score'],
-                'trend': tech_result.get('trend', 50),
-                'momentum': tech_result.get('momentum', 50),
-                'volume': tech_result.get('volume', 50),
-                'volatility': tech_result.get('volatility', 50),
+                'score': tech_stretched,
+                'raw_score': tech_result['score'],
+                'trend': stretch_score(tech_result.get('trend', 50)),
+                'momentum': stretch_score(tech_result.get('momentum', 50)),
+                'volume': stretch_score(tech_result.get('volume', 50)),
+                'volatility': stretch_score(tech_result.get('volatility', 50)),
+                'statistical': stretch_score(tech_result.get('statistical', 50)),
+                'institutional': stretch_score(tech_result.get('institutional', 50)),
+                'winrate': stretch_score(tech_result.get('winrate', 50)),
                 'key_signals': tech_result.get('key_signals', []),
             },
             'fundamental': {
-                'score': fund_result['score'],
+                'score': fund_stretched,
+                'raw_score': fund_result['score'],
                 'pe_vs_sector': fund_result.get('pe_vs_sector', 'N/A'),
                 'revenue_growth': fund_result.get('revenue_growth', 'N/A'),
                 'earnings_surprise': fund_result.get('earnings_surprise', 'N/A'),
                 'key_signals': fund_result.get('key_signals', []),
             },
             'sentiment': {
-                'score': sent_result['score'],
+                'score': sent_stretched,
+                'raw_score': sent_result['score'],
                 'news_sentiment': sent_result.get('news_sentiment', 'N/A'),
                 'reddit_buzz': sent_result.get('reddit_buzz', 'N/A'),
                 'analyst_consensus': sent_result.get('analyst_consensus', 'N/A'),
                 'key_signals': sent_result.get('key_signals', []),
             },
             'ai_insight': {
-                'score': ai_result['score'],
+                'score': ai_stretched,
+                'raw_score': ai_result['score'],
                 'models_used': multi_model.get('models_used', 1) if multi_model else 1,
                 'reasoning': ai_result.get('reasoning', ''),
                 'agreements': ai_result.get('agreements', []),
@@ -629,6 +795,20 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         'action': action,
         'weight_profile': weights.get('label', 'default'),
         'market_cap_category': cap_label,
+        'market_regime': {
+            'regime': regime.get('regime'),
+            'reasoning': regime.get('reasoning'),
+            'spy_above_200': regime.get('spy_trend', {}).get('above_200'),
+            'vix': regime.get('vix', {}).get('vix'),
+            'vix_zone': regime.get('vix', {}).get('zone'),
+            'pre_regime_signal': pre_regime_signal if pre_regime_signal != signal else None,
+            'regime_note': regime_note if regime_note else None,
+        },
+        'earnings_window': {
+            'days_until': earnings_days,
+            'date': earnings_date,
+            'warning': earnings_warning,
+        } if earnings_days is not None else None,
         'technical_data': {
             'rsi': safe_float(latest.get('RSI', 50), 50),
             'macd': safe_float(latest.get('MACD', 0)),
@@ -640,6 +820,21 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
             'bb_upper': safe_float(latest.get('BB_Upper', price), price),
             'bb_lower': safe_float(latest.get('BB_Lower', price), price),
             'atr': safe_float(latest.get('ATR', 0)),
+            'zscore': safe_float(latest.get('ZScore', 0)),
+            'linreg_slope': safe_float(latest.get('LinReg_Slope', 0)),
+            'linreg_r2': safe_float(latest.get('LinReg_R2', 0)),
+            'hurst': safe_float(latest.get('Hurst', 0)),
+            'vwap_20': safe_float(latest.get('VWAP_20', 0)),
+            'rs_spy_20': safe_float(latest.get('RS_SPY_20', 0)),
+            'rs_spy_50': safe_float(latest.get('RS_SPY_50', 0)),
+            'ichimoku_tenkan': safe_float(latest.get('Ichi_Tenkan', 0)),
+            'ichimoku_kijun': safe_float(latest.get('Ichi_Kijun', 0)),
+            'ichimoku_senkou_a': safe_float(latest.get('Ichi_SenkouA', 0)),
+            'ichimoku_senkou_b': safe_float(latest.get('Ichi_SenkouB', 0)),
+            'cmf': safe_float(latest.get('CMF', 0)),
+            'fib_382': safe_float(latest.get('Fib_382', 0)),
+            'fib_500': safe_float(latest.get('Fib_500', 0)),
+            'fib_618': safe_float(latest.get('Fib_618', 0)),
         },
         'news': news_list,
         'price_history': price_history,
@@ -649,11 +844,13 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
                 ['yfinance', 'newsapi']
                 + (['reddit'] if reddit_scraper else [])
                 + (['finviz'] if finviz_data else [])
+                + (['sec_edgar'] if sec_data else [])
                 + berkeley_sources_available
             ),
             'sources_failed': berkeley_sources_failed,
             'berkeley_enhanced': bool(berkeley_sources_available),
             'berkeley_source_count': num_berkeley,
+            'sec_enhanced': bool(sec_data),
             'confidence_boost': num_berkeley >= 3,
         },
     }
