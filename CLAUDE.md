@@ -35,15 +35,18 @@
 
 ```
 analysis/
-  ai_analyzer.py          # Claude AI engine
-  gemini_analyzer.py       # Gemini engine
-  chatgpt_analyzer.py      # GPT-4o engine
-  composite_scorer.py      # Master scorer: sub-scores + 3-model AI consensus
-  technical_scorer.py      # Quant technical score (0-100)
-  fundamental_scorer.py    # Quant fundamental score (0-100)
-  sentiment_scorer.py      # Quant sentiment score (0-100)
-  horizon_screener.py      # 3-horizon screener (short/mid/long) — NO AI calls
-  technical_analysis.py    # RSI, MACD, Bollinger, SMA, indicators
+  ai_analyzer.py          # Claude — BULL CASE role in 3-model consensus
+  gemini_analyzer.py       # Gemini — BEAR CASE role
+  chatgpt_analyzer.py      # GPT-4o — SYNTHESIZER role
+  composite_scorer.py      # Master scorer: subs + AI consensus + regime/earnings gates
+  technical_scorer.py      # Tech score (0-100); walk-forward purged win-rate
+  fundamental_scorer.py    # Fund score; incl. EPS revisions, Piotroski-lite, short interest
+  sentiment_scorer.py      # Sentiment; Haiku headline classifier + options positioning
+  market_regime.py         # SPY+VIX regime gate (risk_on/neutral/risk_off)
+  options_signals.py       # IV/RV, put/call ratio, OI skew
+  backtest_validator.py    # Scores past analyses vs realized T+5/T+10/T+30 returns
+  horizon_screener.py      # 3-horizon screener; sector-diversified (max 2 per sector)
+  technical_analysis.py    # Indicators incl. RS_SPY + RS_SECTOR (vs sector ETF)
   hybrid_recommender.py    # Technical + AI signal combiner
   stock_screener.py        # Preset screening strategies
   discovery_engine.py      # Hidden gem / catalyst discovery
