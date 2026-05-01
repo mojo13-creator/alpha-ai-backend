@@ -769,30 +769,50 @@ def score_institutional(df, latest):
 
 
 def score_setup_winrate(df, latest, prev):
-    """Score based on historical pattern win rate (0-100).
-    Backtests current indicator setup against past occurrences in the data."""
+    """
+    Score based on historical pattern win rate (0-100). Walk-forward + costed.
+
+    Improvements over prior version:
+      - Counts a "win" only if return exceeds 0.3% (rough commission + slippage
+        round-trip). The old version called any positive close a win, which
+        inflated win rates in any uptrending series.
+      - Requires a 6-bar gap between matched setups (purged sampling) so
+        overlapping look-forward windows don't double-count the same move.
+      - Raises minimum sample to 10 setups.
+      - Reports median return alongside hit rate so a high-hit-rate setup
+        with a single huge loss doesn't look better than it is.
+      - Composite score blends hit rate (60%) with profitability tilt (40%)
+        so a 55% hit rate with strong avg returns beats a 60% hit rate with
+        flat returns.
+
+    Still single-symbol in-sample — true cross-validation belongs in the
+    backtest_validator harness, not the scoring path.
+    """
     signals = []
     price = safe_float(latest['close'])
     if price <= 0 or len(df) < 60:
         return 50, ["Insufficient history for pattern backtesting"]
 
-    # Define the current "setup" using key indicator states
+    # Cost threshold: 30 bps round-trip. Anything inside this is noise.
+    COST_THRESHOLD_PCT = 0.3
+    GAP_BARS = 6  # purge between matched setups
+
     rsi = safe_float(latest.get('RSI', 50))
     macd_hist = safe_float(latest.get('MACD_Histogram', 0))
     above_sma50 = price > safe_float(latest.get('SMA_50', 0)) if safe_float(latest.get('SMA_50', 0)) > 0 else None
 
-    # Backtest: find past bars with similar conditions and check what happened next
+    rsi_low = rsi - 7
+    rsi_high = rsi + 7
+
     wins_5d = 0
     losses_5d = 0
     wins_10d = 0
     losses_10d = 0
-    total_setups = 0
+    returns_5d = []
+    returns_10d = []
+    last_match_idx = -GAP_BARS - 1
 
-    # RSI zone matching
-    rsi_low = rsi - 7
-    rsi_high = rsi + 7
-
-    for i in range(50, len(df) - 11):  # Need 10 days forward to measure outcome
+    for i in range(50, len(df) - 11):
         row = df.iloc[i]
         row_rsi = safe_float(row.get('RSI', 0))
         row_macd_hist = safe_float(row.get('MACD_Histogram', 0))
@@ -802,7 +822,10 @@ def score_setup_winrate(df, latest, prev):
         if row_rsi <= 0 or row_price <= 0:
             continue
 
-        # Match conditions: similar RSI zone + same MACD sign + same SMA50 side
+        # Purged sampling — skip if too close to the previous match
+        if i - last_match_idx < GAP_BARS:
+            continue
+
         rsi_match = rsi_low <= row_rsi <= rsi_high
         macd_match = (macd_hist > 0 and row_macd_hist > 0) or (macd_hist <= 0 and row_macd_hist <= 0)
         sma_match = True
@@ -810,43 +833,63 @@ def score_setup_winrate(df, latest, prev):
             sma_match = (row_price > row_sma50) == above_sma50
 
         if rsi_match and macd_match and sma_match:
-            total_setups += 1
-            # 5-day outcome
+            last_match_idx = i
+
             future_5 = safe_float(df.iloc[i + 5]['close'])
-            if future_5 > row_price:
+            ret_5 = (future_5 - row_price) / row_price * 100
+            returns_5d.append(ret_5)
+            if ret_5 > COST_THRESHOLD_PCT:
                 wins_5d += 1
-            else:
+            elif ret_5 < -COST_THRESHOLD_PCT:
                 losses_5d += 1
-            # 10-day outcome
+            # ret in [-cost, +cost] = flat, neither win nor loss
+
             future_10 = safe_float(df.iloc[i + 10]['close'])
-            if future_10 > row_price:
+            ret_10 = (future_10 - row_price) / row_price * 100
+            returns_10d.append(ret_10)
+            if ret_10 > COST_THRESHOLD_PCT:
                 wins_10d += 1
-            else:
+            elif ret_10 < -COST_THRESHOLD_PCT:
                 losses_10d += 1
 
-    if total_setups < 5:
-        return 50, [f"Only {total_setups} similar historical setups — insufficient for probability estimate"]
+    total_setups = len(returns_5d)
+    if total_setups < 10:
+        return 50, [f"Only {total_setups} purged historical setups — insufficient for probability estimate"]
 
-    winrate_5d = (wins_5d / total_setups) * 100
-    winrate_10d = (wins_10d / total_setups) * 100
-
-    # Average the two timeframes
+    decided_5 = wins_5d + losses_5d
+    decided_10 = wins_10d + losses_10d
+    winrate_5d = (wins_5d / decided_5) * 100 if decided_5 else 50
+    winrate_10d = (wins_10d / decided_10) * 100 if decided_10 else 50
     avg_winrate = (winrate_5d + winrate_10d) / 2
 
-    # Convert win rate to score: 50% = neutral, >65% = bullish, <35% = bearish
-    # Scale: 50% winrate = 50 score, 80% = ~90, 20% = ~10
-    score = avg_winrate  # Direct mapping since winrate is already 0-100
+    # Median return (robust to outliers)
+    sorted_5 = sorted(returns_5d)
+    sorted_10 = sorted(returns_10d)
+    median_5 = sorted_5[len(sorted_5) // 2]
+    median_10 = sorted_10[len(sorted_10) // 2]
+    median_avg = (median_5 + median_10) / 2
 
-    signals.append(f"Historical win rate: {winrate_5d:.0f}% (5d) / {winrate_10d:.0f}% (10d) from {total_setups} similar setups")
+    # Profitability tilt: map median return into a score modifier centered at 50.
+    # +1% median ≈ +10 score, -1% median ≈ -10. Capped at ±15.
+    profit_tilt = max(-15, min(15, median_avg * 10))
 
-    if avg_winrate >= 70:
-        signals.append(f"High-probability bullish setup — {avg_winrate:.0f}% historical success rate")
-    elif avg_winrate >= 60:
-        signals.append(f"Favorable odds — {avg_winrate:.0f}% historical success rate")
-    elif avg_winrate <= 30:
-        signals.append(f"High-probability bearish setup — only {avg_winrate:.0f}% historically went up")
-    elif avg_winrate <= 40:
-        signals.append(f"Unfavorable odds — only {avg_winrate:.0f}% historical success rate")
+    # Blend: 60% hit rate, 40% profitability
+    score = avg_winrate * 0.6 + (50 + profit_tilt) * 0.4
+
+    signals.append(
+        f"Win rate: {winrate_5d:.0f}% (5d) / {winrate_10d:.0f}% (10d), "
+        f"median ret {median_5:+.2f}% / {median_10:+.2f}%, n={total_setups} setups "
+        f"(0.3% cost, 6-bar purge)"
+    )
+
+    if score >= 70:
+        signals.append(f"High-probability setup — wins {avg_winrate:.0f}% with median {median_avg:+.2f}%")
+    elif score >= 60:
+        signals.append(f"Favorable setup — {avg_winrate:.0f}% wins, median {median_avg:+.2f}%")
+    elif score <= 30:
+        signals.append(f"Adverse setup — only {avg_winrate:.0f}% wins, median {median_avg:+.2f}%")
+    elif score <= 40:
+        signals.append(f"Unfavorable setup — {avg_winrate:.0f}% wins, median {median_avg:+.2f}%")
 
     return max(0, min(100, round(score))), signals
 
