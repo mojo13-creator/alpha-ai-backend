@@ -436,13 +436,16 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
     cap_cat = fund_result.get('market_cap_category', 'unknown')
     cap_label = fund_result.get('market_cap_label', 'Unknown')
 
-    # 7. Sentiment Score
+    # 7. Sentiment Score (now includes options-derived positioning)
     sent_result = calculate_sentiment_score(
         news_articles=news_articles,
         reddit_scraper=reddit_scraper,
         symbol=symbol,
         finviz_data=finviz_data,
         berkeley_data=berkeley_data or None,
+        current_price=price,
+        price_df=df,
+        ticker_obj=ticker_obj,
     )
     print(f"  Sentiment Score: {sent_result['score']}/100")
 

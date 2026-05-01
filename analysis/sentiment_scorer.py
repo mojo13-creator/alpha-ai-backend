@@ -348,10 +348,14 @@ def _berkeley_sentiment_adjustment(berkeley_data):
 
 
 def calculate_sentiment_score(news_articles, reddit_scraper=None, symbol='',
-                               finviz_data=None, berkeley_data=None):
+                               finviz_data=None, berkeley_data=None,
+                               current_price=None, price_df=None, ticker_obj=None):
     """
     Master function: calculates composite sentiment score (0-100).
     Returns dict with score, sub-components, and key_signals.
+
+    Optional: pass current_price + price_df + ticker_obj to enable
+    options-derived positioning signals (IV/RV, put/call ratio, OI skew).
     """
     # News: 50% weight
     news_score, news_signals, news_label = score_news_sentiment(news_articles, symbol=symbol)
@@ -368,12 +372,25 @@ def calculate_sentiment_score(news_articles, reddit_scraper=None, symbol='',
     # Berkeley institutional sentiment (supplementary adjustment)
     berkeley_adj, berkeley_signals = _berkeley_sentiment_adjustment(berkeley_data)
 
-    # Composite: news 50%, reddit 25%, finviz + berkeley adjust the base
+    # Options positioning (supplementary adjustment, [-12, +12])
+    options_adj = 0
+    options_signals = []
+    options_info = None
+    if symbol and current_price and current_price > 0:
+        try:
+            from analysis.options_signals import score_options_positioning
+            options_adj, options_signals, options_info = score_options_positioning(
+                symbol, current_price, df=price_df, ticker_obj=ticker_obj
+            )
+        except Exception as e:
+            options_signals = [f'Options signals unavailable: {e}']
+
+    # Composite: news 50%, reddit 25%, finviz + berkeley + options adjust the base
     base_score = news_score * 0.50 + reddit_score * 0.25 + 50 * 0.25
-    composite = base_score + finviz_adj + berkeley_adj
+    composite = base_score + finviz_adj + berkeley_adj + options_adj
     composite = max(0, min(100, round(composite)))
 
-    all_signals = news_signals + reddit_signals + finviz_signals + berkeley_signals
+    all_signals = news_signals + reddit_signals + finviz_signals + berkeley_signals + options_signals
     analyst_label = 'N/A'
     for sig in finviz_signals:
         if 'upgrade' in sig.lower():
@@ -394,4 +411,5 @@ def calculate_sentiment_score(news_articles, reddit_scraper=None, symbol='',
         'reddit_buzz': f'{buzz_label} and {"positive" if reddit_score > 55 else "negative" if reddit_score < 45 else "neutral"}',
         'analyst_consensus': analyst_label,
         'key_signals': all_signals[:10],
+        'options_positioning': options_info,
     }
