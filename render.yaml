@@ -1,0 +1,45 @@
+# Render Blueprint — Alpha AI backend
+# https://render.com/docs/blueprint-spec
+#
+# To deploy: render.com → New → Blueprint → connect this repo →
+# Render reads this file and provisions everything below.
+#
+# Free tier characteristics:
+#   - 750 hours/month free (~24/7 for one service)
+#   - Sleeps after 15 min idle, ~30s cold start on next request
+#   - 512MB RAM, 0.1 CPU — fine for our analyses
+#   - No persistent disk on free tier (SQLite resets on redeploy —
+#     fine because we use yfinance + APIs, not stored historical data)
+
+services:
+  - type: web
+    name: alpha-ai-backend
+    runtime: python
+    region: oregon
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      # Pin Python to 3.13 to match what Railway was using.
+      # CLAUDE.md notes 3.13 prod, 3.14 local — keep prod consistent.
+      - key: PYTHON_VERSION
+        value: 3.13.0
+      # Secrets — set these in Render dashboard (not in this file)
+      - key: CLAUDE_API_KEY
+        sync: false
+      - key: NEWS_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      # Optional Reddit (only if RedditScraper is wired up)
+      - key: REDDIT_CLIENT_ID
+        sync: false
+      - key: REDDIT_CLIENT_SECRET
+        sync: false
+      - key: REDDIT_USER_AGENT
+        sync: false
