@@ -140,10 +140,91 @@ def calculate_berkeley_adjustment(berkeley_data):
     return adj, signals
 
 
-def calculate_fundamental_score(symbol, berkeley_data=None):
+def calculate_sec_edgar_adjustment(sec_data):
+    """
+    Calculate score adjustment from SEC EDGAR data.
+    Returns (adjustment_points, signals_list). Max +-10 points.
+    """
+    adj = 0.0
+    signals = []
+
+    if not sec_data:
+        return 0, []
+
+    # --- Insider trading activity (Form 4 filings) ---
+    insider = sec_data.get("insider_summary", {})
+    if insider:
+        form4_count = insider.get("total_form4_filings", 0)
+        if form4_count > 10:
+            # Heavy insider activity — could be buying or selling
+            signals.append(f"SEC: {form4_count} insider transactions (90d)")
+        elif form4_count > 0:
+            signals.append(f"SEC: {form4_count} insider transactions (90d)")
+
+    # --- Material events (8-K filings) ---
+    material_events = sec_data.get("material_events", 0)
+    if material_events >= 5:
+        adj -= 3
+        signals.append(f"SEC: {material_events} material event filings (8-K) in 6 months — high activity")
+    elif material_events >= 3:
+        signals.append(f"SEC: {material_events} material events (8-K) recently")
+
+    # --- Revenue YoY growth from XBRL ---
+    rev_yoy = sec_data.get("revenue_yoy_growth")
+    if rev_yoy is not None:
+        if rev_yoy > 25:
+            adj += 4
+            signals.append(f"SEC filing revenue growth: {rev_yoy:+.1f}% YoY")
+        elif rev_yoy > 10:
+            adj += 2
+            signals.append(f"SEC filing revenue growth: {rev_yoy:+.1f}% YoY")
+        elif rev_yoy < -25:
+            adj -= 5
+            signals.append(f"SEC filing revenue decline: {rev_yoy:+.1f}% YoY")
+        elif rev_yoy < -10:
+            adj -= 3
+            signals.append(f"SEC filing revenue decline: {rev_yoy:+.1f}% YoY")
+
+    # --- Net income trend ---
+    ni_yoy = sec_data.get("net_income_yoy_growth")
+    if ni_yoy == "turnaround":
+        adj += 3
+        signals.append("SEC: net income turned positive (turnaround)")
+    elif ni_yoy == "negative":
+        adj -= 2
+        signals.append("SEC: net income is negative")
+    elif isinstance(ni_yoy, (int, float)):
+        if ni_yoy > 30:
+            adj += 3
+            signals.append(f"SEC filing net income growth: {ni_yoy:+.1f}% YoY")
+        elif ni_yoy < -30:
+            adj -= 3
+            signals.append(f"SEC filing net income decline: {ni_yoy:+.1f}% YoY")
+
+    # --- Cash position from XBRL ---
+    facts = sec_data.get("company_facts", {})
+    cash_data = facts.get("CashAndEquivalents_annual", {})
+    cash_val = cash_data.get("value")
+    total_debt_data = facts.get("TotalDebt_annual", {})
+    debt_val = total_debt_data.get("value")
+    if cash_val is not None and debt_val is not None and debt_val > 0:
+        cash_to_debt = cash_val / debt_val
+        if cash_to_debt > 2.0:
+            adj += 2
+            signals.append(f"SEC: strong cash/debt ratio ({cash_to_debt:.1f}x)")
+        elif cash_to_debt < 0.2:
+            adj -= 2
+            signals.append(f"SEC: weak cash/debt ratio ({cash_to_debt:.1f}x)")
+
+    # Clamp to +-10
+    adj = max(-10, min(10, round(adj)))
+    return adj, signals
+
+
+def calculate_fundamental_score(symbol, berkeley_data=None, sec_data=None):
     """
     Calculate fundamental score (0-100) from yfinance data.
-    Optionally enhanced with Berkeley institutional data.
+    Optionally enhanced with Berkeley institutional data and SEC EDGAR data.
     Returns dict with score, key metrics, key_signals, and market_cap info.
     """
     signals = []
@@ -368,6 +449,101 @@ def calculate_fundamental_score(symbol, berkeley_data=None):
             score -= 8
             signals.append(f'Analyst consensus: Sell ({rec_mean:.1f})')
 
+    # ===== Earnings Estimate Revisions =====
+    # Net up vs down EPS estimate revisions over the last 30 days. Sell-side
+    # revision direction is one of the most documented alpha factors —
+    # analyst estimates trending up tends to precede price.
+    try:
+        revs = ticker.eps_revisions
+        if revs is not None and not revs.empty:
+            # Use the +1q (next quarter) row as the most actionable signal
+            row = revs.loc['+1q'] if '+1q' in revs.index else revs.iloc[1]
+            up = safe_float(row.get('upLast30days', 0))
+            down = safe_float(row.get('downLast30days', 0))
+            if up + down > 0:
+                net = up - down
+                if net >= 5:
+                    score += 10
+                    signals.append(f'EPS revisions strongly positive ({int(up)}↑/{int(down)}↓ 30d)')
+                elif net >= 2:
+                    score += 6
+                    signals.append(f'EPS revisions trending up ({int(up)}↑/{int(down)}↓ 30d)')
+                elif net <= -5:
+                    score -= 10
+                    signals.append(f'EPS revisions strongly negative ({int(up)}↑/{int(down)}↓ 30d)')
+                elif net <= -2:
+                    score -= 6
+                    signals.append(f'EPS revisions trending down ({int(up)}↑/{int(down)}↓ 30d)')
+    except Exception:
+        pass
+
+    # ===== Piotroski-lite Quality Score =====
+    # Subset of Piotroski's 9-point F-Score using fields available without
+    # multi-year financial parsing. 8 binary criteria — high score = quality.
+    try:
+        ni = safe_float(info.get('netIncomeToCommon', 0))
+        ocf = safe_float(info.get('operatingCashflow', 0))
+        roa = safe_float(info.get('returnOnAssets', 0))
+        cur_ratio = safe_float(info.get('currentRatio', 0))
+        gross_m = safe_float(info.get('grossMargins', 0))
+        total_debt = safe_float(info.get('totalDebt', 0))
+        fcf_pl = safe_float(info.get('freeCashflow', 0))
+
+        f_score = 0
+        f_score += 1 if ni > 0 else 0                       # profitable
+        f_score += 1 if ocf > 0 else 0                       # cash-generating
+        f_score += 1 if (ocf > ni and ni > 0) else 0         # earnings quality (CFO > NI)
+        f_score += 1 if roa > 0.05 else 0                    # ROA > 5%
+        f_score += 1 if cur_ratio > 1.0 else 0               # liquidity
+        f_score += 1 if gross_m > 0.30 else 0                # gross margin > 30%
+        f_score += 1 if (market_cap > 0 and total_debt / market_cap < 0.5) else 0  # leverage
+        f_score += 1 if fcf_pl > 0 else 0                    # FCF positive
+
+        if f_score >= 7:
+            score += 8
+            signals.append(f'Piotroski-lite quality score {f_score}/8 — high quality')
+        elif f_score >= 5:
+            score += 4
+            signals.append(f'Piotroski-lite quality score {f_score}/8')
+        elif f_score <= 2:
+            score -= 8
+            signals.append(f'Piotroski-lite quality score {f_score}/8 — weak fundamentals')
+        elif f_score <= 3:
+            score -= 4
+            signals.append(f'Piotroski-lite quality score {f_score}/8 — below average')
+    except Exception:
+        pass
+
+    # ===== Short Interest =====
+    # High short interest = squeeze setup (bullish if other signals positive),
+    # also a tell that smart money expects trouble. We treat it bidirectionally:
+    # very high SI is a contrarian bullish setup, moderately elevated is bearish.
+    short_pct = safe_float(info.get('shortPercentOfFloat', 0))
+    if short_pct > 0:
+        si_pct = short_pct * 100
+        if si_pct > 25:
+            score += 6
+            signals.append(f'Short interest {si_pct:.1f}% of float — heavy squeeze potential')
+        elif si_pct > 15:
+            # Bearish bet but not yet squeeze territory
+            score -= 3
+            signals.append(f'Short interest {si_pct:.1f}% of float — elevated bearish positioning')
+        elif si_pct > 8:
+            score -= 1
+            signals.append(f'Short interest {si_pct:.1f}% of float')
+
+    # Short interest CHANGE (institutional positioning shift)
+    shares_short = safe_float(info.get('sharesShort', 0))
+    shares_short_prior = safe_float(info.get('sharesShortPriorMonth', 0))
+    if shares_short > 0 and shares_short_prior > 0:
+        si_change_pct = ((shares_short - shares_short_prior) / shares_short_prior) * 100
+        if si_change_pct > 25:
+            score -= 3
+            signals.append(f'Shorts ramping up {si_change_pct:+.0f}% MoM — bearish positioning')
+        elif si_change_pct < -25:
+            score += 3
+            signals.append(f'Shorts covering {si_change_pct:+.0f}% MoM — bears giving up')
+
     score = max(0, min(100, round(score)))
 
     # Berkeley enrichment adjustment (supplementary — score works fine without it)
@@ -381,17 +557,27 @@ def calculate_fundamental_score(symbol, berkeley_data=None):
             berkeley_enhanced = True
             berkeley_sources = list(berkeley_data.keys())
 
+    # SEC EDGAR adjustment (free public data — insider trades, filings, XBRL financials)
+    sec_enhanced = False
+    if sec_data:
+        sec_adj, sec_signals = calculate_sec_edgar_adjustment(sec_data)
+        if sec_adj != 0 or sec_signals:
+            score = max(0, min(100, score + sec_adj))
+            signals.extend(sec_signals)
+            sec_enhanced = True
+
     return {
         'score': score,
         'pe_vs_sector': pe_label,
         'revenue_growth': rev_label,
         'earnings_surprise': earnings_label,
-        'key_signals': signals[:10],
+        'key_signals': signals[:12],
         'market_cap': market_cap,
         'market_cap_category': cap_cat,
         'market_cap_label': cap_label,
         'berkeley_enhanced': berkeley_enhanced,
         'berkeley_sources': berkeley_sources,
+        'sec_enhanced': sec_enhanced,
     }
 
 
