@@ -34,7 +34,8 @@ class AIStockAnalyzer:
 
     def get_ai_insight_score(self, symbol, price, stock_info, technical_result,
                               fundamental_result, sentiment_result, news_headlines,
-                              df=None, berkeley_data=None, user_period=None):
+                              df=None, berkeley_data=None, user_period=None,
+                              sec_data=None):
         """
         Call Claude API for the AI Insight sub-score.
         Receives all other sub-scores + raw data. Returns dict with score,
@@ -54,7 +55,7 @@ class AIStockAnalyzer:
             prompt = self._build_prompt(
                 symbol, price, stock_info, technical_result,
                 fundamental_result, sentiment_result, news_headlines, df,
-                berkeley_data, user_period
+                berkeley_data, user_period, sec_data
             )
 
             message = client.messages.create(
@@ -72,7 +73,7 @@ class AIStockAnalyzer:
 
     def _build_prompt(self, symbol, price, stock_info, technical, fundamental,
                       sentiment, news_headlines, df, berkeley_data=None,
-                      user_period=None):
+                      user_period=None, sec_data=None):
         """Build the decisive analyst prompt with all data."""
 
         # Gather technical details from the dataframe
@@ -90,7 +91,15 @@ RAW TECHNICAL DATA:
   ATR: ${safe_float(latest.get('ATR', 0)):.2f}
   Stochastic %K/%D: {safe_float(latest.get('STOCH', 0)):.1f} / {safe_float(latest.get('STOCH_Signal', 0)):.1f}
   ADX: {safe_float(latest.get('ADX', 0)):.1f}
-  Volume: {int(safe_float(latest.get('volume', 0))):,}"""
+  Volume: {int(safe_float(latest.get('volume', 0))):,}
+  Z-Score (50d): {safe_float(latest.get('ZScore', 0)):.2f}
+  LinReg Slope: {safe_float(latest.get('LinReg_Slope', 0)):.4f} (R²: {safe_float(latest.get('LinReg_R2', 0)):.2f})
+  Hurst Exponent: {safe_float(latest.get('Hurst', 0)):.2f}
+  VWAP (20d): ${safe_float(latest.get('VWAP_20', 0)):.2f}
+  RS vs SPY (20d/50d): {safe_float(latest.get('RS_SPY_20', 0)):+.1f}pp / {safe_float(latest.get('RS_SPY_50', 0)):+.1f}pp
+  Ichimoku: Tenkan ${safe_float(latest.get('Ichi_Tenkan', 0)):.2f}, Kijun ${safe_float(latest.get('Ichi_Kijun', 0)):.2f}, Cloud ${safe_float(latest.get('Ichi_SenkouA', 0)):.2f}-${safe_float(latest.get('Ichi_SenkouB', 0)):.2f}
+  Chaikin Money Flow: {safe_float(latest.get('CMF', 0)):.3f}
+  Fibonacci: 38.2%=${safe_float(latest.get('Fib_382', 0)):.2f}, 50%=${safe_float(latest.get('Fib_500', 0)):.2f}, 61.8%=${safe_float(latest.get('Fib_618', 0)):.2f}"""
 
             # Price change context
             if len(df) >= 5:
@@ -130,14 +139,22 @@ COMPANY INFO:
 
         prompt = f"""You are a decisive stock analyst. You DO NOT hedge. You DO NOT cluster scores in the safe middle range.
 
+ROLE — BULL CASE ANALYST (1 of 3 models in consensus):
+You are the bull-case lens. Your job: find the strongest credible reason this stock could outperform over the user's horizon. Force yourself to identify the bull thesis BEFORE looking at the score range. Then stress-test it: do the numbers actually support it? Is there a catalyst? What would have to be true?
+
+If the bull case survives scrutiny → score high (75+).
+If the bull case has a fatal flaw → score low even though you tried to find one (your honest score must dominate over your assigned lens). Better to say "I tried to make the bull case and couldn't" than to invent one.
+
+You are NOT being asked to be a cheerleader. You are being asked to be the model that prosecutes the bull thesis aggressively. Two other models (bear, synth) are doing the same from other angles. The user gets the consensus.
+
 ANALYZE: {symbol} at ${price:.2f}
 INVESTMENT HORIZON: {horizon_label} — the user is evaluating this stock for a {horizon_label} hold. Your entry_price, stop_loss, target_price, and time_horizon MUST be calibrated to this timeframe. Do NOT suggest a 1-2 week target if the user is looking at 3 months.
 {info_block}
 {tech_details}
 
 PRE-COMPUTED SUB-SCORES (from our quantitative models):
-  Technical Score: {technical.get('score', 'N/A')}/100 (Trend: {technical.get('trend', 'N/A')}, Momentum: {technical.get('momentum', 'N/A')}, Volume: {technical.get('volume', 'N/A')}, Volatility: {technical.get('volatility', 'N/A')})
-  Technical Signals: {', '.join(technical.get('key_signals', [])[:5])}
+  Technical Score: {technical.get('score', 'N/A')}/100 (Trend: {technical.get('trend', 'N/A')}, Momentum: {technical.get('momentum', 'N/A')}, Volume: {technical.get('volume', 'N/A')}, Volatility: {technical.get('volatility', 'N/A')}, Statistical: {technical.get('statistical', 'N/A')}, Institutional: {technical.get('institutional', 'N/A')}, Win Rate: {technical.get('winrate', 'N/A')})
+  Technical Signals: {', '.join(technical.get('key_signals', [])[:8])}
 
   Fundamental Score: {fundamental.get('score', 'N/A')}/100
   P/E: {fundamental.get('pe_vs_sector', 'N/A')} | Revenue Growth: {fundamental.get('revenue_growth', 'N/A')} | Earnings: {fundamental.get('earnings_surprise', 'N/A')}
@@ -151,6 +168,8 @@ PRE-COMPUTED SUB-SCORES (from our quantitative models):
 
 {self._build_berkeley_block(berkeley_data)}
 
+{self._build_sec_edgar_block(sec_data)}
+
 YOUR TASK:
 1. Review ALL the data above
 2. Identify patterns the quantitative models might miss (sector rotation, macro correlation, earnings setup, competitive dynamics)
@@ -158,15 +177,27 @@ YOUR TASK:
 4. Give your OWN conviction score (0-100) with mandatory reasoning
 5. Flag any disagreement with the sub-scores and explain why
 
-SCORING RULES YOU MUST FOLLOW:
-- Scores above 80: Stock has multiple strong bullish signals aligned across technicals, fundamentals, and sentiment. You are confident this is a good entry.
-- Scores 60-79: Stock has more bullish than bearish signals but some concerns exist. Specify what would push it higher or lower.
-- Scores 40-59: Stock is genuinely mixed or unclear. You should rarely land here — dig deeper and take a stance.
-- Scores 20-39: Stock has significant red flags. Be specific about what's wrong.
-- Scores below 20: Stock is in serious trouble or is a clear trap. Say so directly.
+SCORING RULES — MANDATORY, READ CAREFULLY:
 
-You MUST justify your score with specific data points, not vague statements.
-If you are uncertain, your score should reflect that uncertainty by being LOWER, not by being in the middle.
+BANNED ZONE: Scores 45-55 are FORBIDDEN. You must NEVER return a score between 45 and 55. That range is a cop-out — every stock has a lean. Find it. If you're tempted to score 50, ask yourself: "Would I put my own money in this stock right now?" If yes, score 65+. If no, score 35 or below.
+
+Score distribution you MUST follow:
+- 85-100 (STRONG BUY): Multiple strong bullish signals aligned. Technicals, fundamentals, AND sentiment all point up. You'd confidently enter this trade.
+- 65-84 (BUY): More bullish than bearish. Good setup with manageable risk. Specify what concerns remain.
+- 56-64 (LEAN BULLISH): Slightly favorable but not enough to commit. Say what's missing for a full buy.
+- 36-44 (LEAN BEARISH): More red flags than green. Say what's wrong specifically.
+- 15-35 (SELL): Significant problems — bad technicals, deteriorating fundamentals, or negative sentiment. Be specific.
+- 0-14 (STRONG SELL): Broken stock, value trap, or serious trouble. Say so directly.
+
+CALIBRATION EXAMPLES — use these as anchors:
+- Score 85+: Stock has RSI recovering from oversold, MACD bullish crossover, price above all major SMAs, strong earnings beat, positive news flow, AND strong relative strength vs SPY. Almost everything aligns.
+- Score 70: Solid uptrend, good fundamentals, but one concern (e.g., overbought stochastic or elevated P/E). Still a buy.
+- Score 40: Stock has a mix but leans negative — maybe downtrend, earnings miss, or bearish sentiment. Not a hold — it's a cautious sell.
+- Score 25: Clear downtrend, multiple bearish indicators, fundamental problems. Get out.
+
+CRITICAL: Your score must be ACTIONABLE. A paid user is relying on this to make real trading decisions. "HOLD at 52" helps nobody. Take a position. Be wrong sometimes — that's fine. Being vague is worse than being wrong.
+
+You MUST justify your score with specific data points from the indicators above, not vague statements like "mixed signals" or "some concerns."
 
 STRATEGY RULES — read carefully:
 - For STRONG BUY / BUY: entry_price = ideal buy price (at or slightly below current), target_price = profit target ABOVE entry, stop_loss = exit price BELOW entry to limit losses.
@@ -308,6 +339,93 @@ Respond ONLY with valid JSON in this exact format:
         lines.append("\nUse this institutional data to validate or challenge your analysis. If your score disagrees with analyst consensus, explain why specifically.")
         return "\n".join(lines)
 
+    def _build_sec_edgar_block(self, sec_data):
+        """Build the SEC EDGAR data section for the prompt."""
+        if not sec_data:
+            return ""
+
+        lines = ["SEC EDGAR DATA (public filings — high-reliability source):"]
+
+        # Insider trading summary
+        insider = sec_data.get("insider_summary", {})
+        if insider:
+            count = insider.get("total_form4_filings", 0)
+            if count > 0:
+                most_recent = insider.get("most_recent", "N/A")
+                lines.append(f"  Insider transactions (Form 4): {count} filings in last {insider.get('period_days', 90)} days (latest: {most_recent})")
+
+        # Revenue YoY from XBRL
+        rev_yoy = sec_data.get("revenue_yoy_growth")
+        if rev_yoy is not None:
+            lines.append(f"  SEC filing revenue growth: {rev_yoy:+.1f}% YoY")
+
+        # Net income trend
+        ni_yoy = sec_data.get("net_income_yoy_growth")
+        if ni_yoy == "turnaround":
+            lines.append("  Net income: turned positive (turnaround from loss)")
+        elif ni_yoy == "negative":
+            lines.append("  Net income: currently negative")
+        elif isinstance(ni_yoy, (int, float)):
+            lines.append(f"  SEC filing net income growth: {ni_yoy:+.1f}% YoY")
+
+        # Company facts from XBRL
+        facts = sec_data.get("company_facts", {})
+        if facts:
+            rev = facts.get("Revenue_annual", {})
+            if rev.get("value"):
+                val = rev["value"]
+                if val > 1_000_000_000:
+                    lines.append(f"  Annual revenue (10-K): ${val/1e9:.1f}B (period ending {rev.get('period_end', 'N/A')})")
+                elif val > 1_000_000:
+                    lines.append(f"  Annual revenue (10-K): ${val/1e6:.0f}M (period ending {rev.get('period_end', 'N/A')})")
+
+            cash = facts.get("CashAndEquivalents_annual", {})
+            if cash.get("value"):
+                val = cash["value"]
+                if val > 1_000_000_000:
+                    lines.append(f"  Cash & equivalents: ${val/1e9:.1f}B")
+                elif val > 1_000_000:
+                    lines.append(f"  Cash & equivalents: ${val/1e6:.0f}M")
+
+            debt = facts.get("TotalDebt_annual", {})
+            if debt.get("value"):
+                val = debt["value"]
+                if val > 1_000_000_000:
+                    lines.append(f"  Long-term debt: ${val/1e9:.1f}B")
+                elif val > 1_000_000:
+                    lines.append(f"  Long-term debt: ${val/1e6:.0f}M")
+
+            fcf = facts.get("FreeCashFlow_annual", {})
+            if fcf.get("value"):
+                val = fcf["value"]
+                if val > 1_000_000_000:
+                    lines.append(f"  Operating cash flow: ${val/1e9:.1f}B")
+                elif val > 1_000_000:
+                    lines.append(f"  Operating cash flow: ${val/1e6:.0f}M")
+                elif val < 0:
+                    lines.append(f"  Operating cash flow: -${abs(val)/1e6:.0f}M (cash burn)")
+
+        # Recent material filings
+        filings = sec_data.get("recent_filings", [])
+        if filings:
+            # Show important recent filings
+            important = [f for f in filings if f["form"] in ("10-K", "10-Q", "8-K", "S-1")][:5]
+            if important:
+                lines.append("  Recent filings:")
+                for f in important:
+                    desc = f.get("description", f["form"])
+                    lines.append(f"    {f['date']} — {f['form']}: {desc}")
+
+        # Material events count
+        if sec_data.get("material_events", 0) > 0:
+            lines.append(f"  Material events (8-K): {sec_data['material_events']} in last 6 months")
+
+        if len(lines) <= 1:
+            return ""
+
+        lines.append("\nSEC filings are the most reliable public data source. Use insider activity and filing patterns to validate your thesis.")
+        return "\n".join(lines)
+
     def _parse_response(self, response_text):
         """Parse Claude's JSON response."""
         try:
@@ -333,8 +451,21 @@ Respond ONLY with valid JSON in this exact format:
                     if entry > 0 and stop > 0 and stop < entry:
                         target, stop = stop, target  # swap
 
+                raw_score = max(0, min(100, int(data.get('score', 50))))
+
+                # Enforce the banned 45-55 dead zone — push to nearest decisive edge
+                if 45 <= raw_score <= 55:
+                    if action in ('STRONG BUY', 'BUY'):
+                        raw_score = 65
+                    elif action in ('SELL', 'STRONG SELL', 'SHORT'):
+                        raw_score = 35
+                    elif raw_score >= 50:
+                        raw_score = 58  # lean bullish
+                    else:
+                        raw_score = 42  # lean bearish
+
                 return {
-                    'score': max(0, min(100, int(data.get('score', 50)))),
+                    'score': raw_score,
                     'reasoning': str(data.get('reasoning', '')),
                     'agreements': data.get('agreements', []),
                     'disagreements': data.get('disagreements', []),
