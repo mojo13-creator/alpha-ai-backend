@@ -149,17 +149,75 @@ class HorizonScreener:
             'sector': sector,
         }
 
-    def _diversify(self, scored, max_picks, max_per_sector=2):
+    def _build_correlation_matrix(self, tickers, lookback_days=60):
+        """
+        Batch-fetch closes for all tickers and return a {ticker: {ticker: corr}}
+        dict over the last `lookback_days` trading days. Returns {} on any
+        failure — callers fall back to sector cap only.
+
+        Sector cap is a proxy; correlation is the real measure. Two "different
+        sector" picks that both track DXY or rates aren't diversified. This adds
+        ~3-5 seconds per screen but only on the candidate set (typically ~50).
+        """
+        if not tickers or len(tickers) < 2:
+            return {}
+        try:
+            import yfinance as yf
+            data = yf.download(
+                tickers=list(tickers),
+                period=f"{max(lookback_days + 20, 90)}d",
+                interval="1d",
+                progress=False,
+                auto_adjust=True,
+                group_by="ticker",
+                threads=True,
+            )
+        except Exception as e:
+            print(f"  ⚠️  Correlation fetch failed ({e}); falling back to sector cap")
+            return {}
+
+        import pandas as pd
+        closes = {}
+        for t in tickers:
+            try:
+                col = data[t]["Close"] if (t, "Close") in data.columns or t in data.columns.get_level_values(0) else None
+                if col is None or col.dropna().empty:
+                    continue
+                closes[t] = col.dropna().tail(lookback_days)
+            except Exception:
+                continue
+        if len(closes) < 2:
+            return {}
+
+        df = pd.DataFrame(closes).pct_change().dropna(how="all")
+        if df.empty or len(df) < 20:
+            return {}
+        corr = df.corr()
+        out = {}
+        for t in corr.columns:
+            out[t] = {u: float(corr.loc[t, u]) for u in corr.columns if u != t and not pd.isna(corr.loc[t, u])}
+        return out
+
+    def _diversify(self, scored, max_picks, max_per_sector=2, max_correlation=0.75):
         """
         Greedy diversification: walk the score-sorted list and accept picks
-        unless adding one would exceed max_per_sector for that sector. Picks
-        without a known sector are accepted up to one slot to avoid blocking
-        ETFs / unclassified names.
+        unless adding one would exceed max_per_sector for that sector OR have
+        a 60-day return correlation above `max_correlation` with any already-
+        selected pick. Picks without a known sector are accepted up to one slot.
 
-        Without this, a single hot sector (semis, oil, biotech) can fill all
-        picks and a "screener" portfolio becomes one concentrated bet.
+        Sector caps prevent "all semis"; correlation caps prevent "different
+        sectors that all move together" (e.g. all rate-sensitive REITs +
+        utilities + homebuilders). Set max_correlation=None to disable.
         """
         scored.sort(key=lambda x: x.get('_rank_score', x.get('composite_score', 0)), reverse=True)
+
+        # Build correlation matrix once over the candidate set (cap at 80 to keep
+        # the yfinance batch reasonable). Only compute if we'll actually use it.
+        corr = {}
+        if max_correlation is not None and len(scored) > 1:
+            tickers = [c.get('ticker') for c in scored[:80] if c.get('ticker')]
+            corr = self._build_correlation_matrix(tickers, lookback_days=60)
+
         picks = []
         sector_counts = {}
         unknown_used = 0
@@ -167,6 +225,17 @@ class HorizonScreener:
             if len(picks) >= max_picks:
                 break
             sec = cand.get('sector')
+            t = cand.get('ticker')
+
+            # Correlation check against picks already selected
+            if max_correlation is not None and corr and t in corr:
+                too_similar = any(
+                    corr[t].get(p.get('ticker'), 0.0) > max_correlation
+                    for p in picks
+                )
+                if too_similar:
+                    continue
+
             if not sec:
                 if unknown_used >= 1:
                     continue
@@ -178,7 +247,7 @@ class HorizonScreener:
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
             picks.append(cand)
 
-        # If sector caps left us short, top up from highest-scored leftovers
+        # If diversification left us short, top up from highest-scored leftovers
         # so we still hit max_picks. Concentration warning still surfaces below.
         if len(picks) < max_picks:
             remaining = [c for c in scored if c not in picks]
