@@ -89,6 +89,13 @@ def determine_signal(composite_score, tech_score, fund_score, sent_score, ai_sco
     Determine actionable signal based on composite + sub-score alignment.
     Returns (signal, confidence, risk_level).
     Thresholds are calibrated for stretch_score() expanded ranges.
+
+    Calibration evidence (2026-05-01, 184 directional samples):
+      - SELL signals at composite >= 38 hit 17-26% (random or worse).
+      - SELL signals at composite < 38 hit 40-43% with avg -10% to -16%.
+      - HIGH-confidence rows with >=3 default (50) sub-scores hit ~17%.
+    Thresholds adjusted accordingly: SELL requires composite < 38, and HIGH
+    confidence requires actual sub-score evidence (not placeholder defaults).
     """
     sub_scores = [tech_score, fund_score, sent_score, ai_score]
     above_70 = sum(1 for s in sub_scores if s >= 70)
@@ -96,6 +103,10 @@ def determine_signal(composite_score, tech_score, fund_score, sent_score, ai_sco
     below_30 = sum(1 for s in sub_scores if s <= 30)
     below_40 = sum(1 for s in sub_scores if s <= 40)
     any_below_20 = any(s < 20 for s in sub_scores)
+
+    # Default-heavy: sub-scores exactly == 50 are scorer placeholders for
+    # missing data, not real evidence. Don't claim HIGH confidence on those.
+    default_subscore_count = sum(1 for s in (fund_score, sent_score, ai_score) if int(s) == 50)
 
     # Score spread = alignment indicator
     spread = max(sub_scores) - min(sub_scores)
@@ -108,7 +119,7 @@ def determine_signal(composite_score, tech_score, fund_score, sent_score, ai_sco
         signal = 'SHORT'
     elif composite_score < 28 or below_30 >= 3:
         signal = 'STRONG_SELL'
-    elif composite_score < 42 or (below_40 >= 2 and any_below_20):
+    elif composite_score < 38 or (below_40 >= 2 and any_below_20):
         signal = 'SELL'
     else:
         signal = 'HOLD'
@@ -120,6 +131,13 @@ def determine_signal(composite_score, tech_score, fund_score, sent_score, ai_sco
         confidence = 'MODERATE'
     else:
         confidence = 'LOW'
+
+    # Cap confidence at LOW when most sub-scores are placeholder defaults —
+    # otherwise spread is artificially small and HIGH confidence is fake.
+    if default_subscore_count >= 3:
+        confidence = 'LOW'
+    elif default_subscore_count == 2 and confidence == 'HIGH':
+        confidence = 'MODERATE'
 
     # Risk level
     if spread > 45 or any_below_20:
@@ -446,6 +464,7 @@ def run_composite_analysis(symbol, db_manager, technical_analyzer, news_scraper,
         current_price=price,
         price_df=df,
         ticker_obj=ticker_obj,
+        sec_data=sec_data or None,
     )
     print(f"  Sentiment Score: {sent_result['score']}/100")
 
