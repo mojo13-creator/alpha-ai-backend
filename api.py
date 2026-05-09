@@ -524,6 +524,7 @@ class ReportPickPortfolioRequest(BaseModel):
     source: str = "daily_report"
     tier: str = "midcap_active"
     shares: float = 0
+    horizon: str = ""  # short_term / mid_term / long_term — auto-maps to tier
 
 @app.post("/api/portfolio/from-report")
 async def add_report_pick_to_portfolio(request: ReportPickPortfolioRequest):
@@ -533,16 +534,28 @@ async def add_report_pick_to_portfolio(request: ReportPickPortfolioRequest):
         if not symbol.isalpha() or len(symbol) > 10:
             raise HTTPException(status_code=400, detail="Invalid ticker symbol")
 
+        # Auto-map horizon to tier if provided
+        tier = request.tier
+        source = request.source
+        if request.horizon:
+            horizon_tier_map = {
+                "short_term": "momentum_trade",
+                "mid_term": "swing_trade",
+                "long_term": "core_holding",
+            }
+            tier = horizon_tier_map.get(request.horizon, tier)
+            source = source if source != "daily_report" else "horizon_screener"
+
         row_id = db.add_portfolio_position(
             symbol=symbol,
             shares=request.shares,
             purchase_price=request.entry_price,
-            notes=f"From daily report | Signal: {request.signal}",
-            tier=request.tier,
+            notes=f"From {source} | Signal: {request.signal} | Horizon: {request.horizon or 'N/A'}",
+            tier=tier,
             stop_loss=request.stop_loss,
             target_price=request.target_price,
             signal=request.signal,
-            source=request.source,
+            source=source,
         )
         return {"message": f"Added {symbol} from daily report", "id": row_id, "ticker": symbol, "signal": request.signal}
     except HTTPException:
@@ -849,7 +862,253 @@ async def get_strong_buys():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ========== HORIZON SCREENER ==========
+from analysis.horizon_screener import HorizonScreener
+
+# Cache for screener results (60 min TTL)
+_screener_cache = {"data": None, "timestamp": None}
+_SCREENER_CACHE_TTL = 3600  # 60 minutes
+
+
+def _get_horizon_screener():
+    return HorizonScreener(db, analyzer, news_scraper)
+
+
+def _get_screener_cache():
+    """Return cached screener results if fresh enough."""
+    if _screener_cache["data"] and _screener_cache["timestamp"]:
+        age = (__import__('datetime').datetime.now() - _screener_cache["timestamp"]).total_seconds()
+        if age < _SCREENER_CACHE_TTL:
+            return _screener_cache["data"]
+    return None
+
+
+def _set_screener_cache(data):
+    _screener_cache["data"] = data
+    _screener_cache["timestamp"] = __import__('datetime').datetime.now()
+
+
+# ========== MARKET SUMMARY ENDPOINT ==========
+
+@app.get("/api/market/summary")
+async def market_summary():
+    """Lightweight market overview — no AI API calls."""
+    import yfinance as yf
+    from datetime import datetime as _dt
+
+    indices = []
+    for name, sym in [("S&P 500", "SPY"), ("NASDAQ", "QQQ"), ("Russell 2000", "IWM"), ("Dow Jones", "DIA")]:
+        try:
+            ticker = yf.Ticker(sym)
+            fast = ticker.fast_info
+            price = safe_float(float(fast.last_price))
+            prev = safe_float(float(fast.previous_close))
+            change_pct = round((price - prev) / prev * 100, 2) if prev > 0 else 0
+            indices.append({"name": name, "symbol": sym, "price": round(price, 2), "change_pct": change_pct})
+        except Exception:
+            indices.append({"name": name, "symbol": sym, "price": 0, "change_pct": 0})
+
+    # Sector outlook from sector ETFs
+    sector_etfs = {
+        'XLK': 'Technology', 'XLV': 'Healthcare', 'XLF': 'Financials',
+        'XLE': 'Energy', 'XLY': 'Consumer Disc.', 'XLP': 'Consumer Staples',
+        'XLI': 'Industrials', 'XLB': 'Materials', 'XLRE': 'Real Estate',
+        'XLU': 'Utilities', 'XLC': 'Communication',
+    }
+    bullish, bearish, neutral = [], [], []
+    for etf, sector in sector_etfs.items():
+        try:
+            t = yf.Ticker(etf)
+            fi = t.fast_info
+            p = safe_float(float(fi.last_price))
+            pc = safe_float(float(fi.previous_close))
+            if p > 0 and pc > 0:
+                ch = round((p - pc) / pc * 100, 2)
+                entry = {"sector": sector, "etf": etf, "change_pct": ch}
+                if ch > 0.5:
+                    bullish.append(entry)
+                elif ch < -0.5:
+                    bearish.append(entry)
+                else:
+                    neutral.append(entry)
+        except Exception:
+            continue
+    bullish.sort(key=lambda x: x['change_pct'], reverse=True)
+    bearish.sort(key=lambda x: x['change_pct'])
+
+    return {
+        "indices": indices,
+        "sector_outlook": {"bullish": bullish, "bearish": bearish, "neutral": neutral},
+        "generated_at": _dt.now().isoformat(),
+    }
+
+
+@app.get("/api/screener/short-term")
+async def screener_short_term():
+    """Short-term momentum plays (1-2 day holds). No AI API calls."""
+    try:
+        screener = _get_horizon_screener()
+        picks = screener.screen_short_term()
+        return {
+            "picks": picks,
+            "horizon": "1-2 days",
+            "strategy": "Momentum Plays",
+            "count": len(picks),
+            "generated_at": __import__('datetime').datetime.now().isoformat(),
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/screener/mid-term")
+async def screener_mid_term():
+    """Mid-term swing trades (2-8 week holds). No AI API calls."""
+    try:
+        screener = _get_horizon_screener()
+        picks = screener.screen_mid_term()
+        return {
+            "picks": picks,
+            "horizon": "2-8 weeks",
+            "strategy": "Swing Trades",
+            "count": len(picks),
+            "generated_at": __import__('datetime').datetime.now().isoformat(),
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/screener/long-term")
+async def screener_long_term():
+    """Long-term core holdings (3+ month holds). No AI API calls."""
+    try:
+        screener = _get_horizon_screener()
+        picks = screener.screen_long_term()
+        return {
+            "picks": picks,
+            "horizon": "3+ months",
+            "strategy": "Core Holdings",
+            "count": len(picks),
+            "generated_at": __import__('datetime').datetime.now().isoformat(),
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/screener/all")
+async def screener_all(force: bool = False):
+    """
+    Run all 3 horizon screens. Returns cached results if available (60 min TTL).
+    Top 3 picks (by composite score) get a full AI analysis (Claude + Gemini + ChatGPT).
+    ?force=true to regenerate.
+    """
+    try:
+        if not force:
+            cached = _get_screener_cache()
+            if cached:
+                return {**cached, "cached": True}
+
+        screener = _get_horizon_screener()
+        result = screener.run_all_horizons()
+
+        # --- AI-enrich top 3 picks across all horizons ---
+        all_picks = []
+        for horizon_key in ('short_term', 'mid_term', 'long_term'):
+            for pick in result.get(horizon_key, {}).get('picks', []):
+                all_picks.append((horizon_key, pick))
+
+        # Sort by composite score descending, take top 3
+        all_picks.sort(key=lambda x: x[1].get('composite_score', 0), reverse=True)
+        top3 = all_picks[:3]
+
+        if top3:
+            print(f"\n🤖 Running AI analysis on top 3 picks: {[p[1]['ticker'] for p in top3]}")
+            from analysis.composite_scorer import run_composite_analysis
+
+            # Init reddit scraper for AI analysis
+            reddit_scraper_instance = None
+            try:
+                reddit_scraper_instance = RedditScraper(db)
+                if reddit_scraper_instance.reddit is None:
+                    reddit_scraper_instance = None
+            except Exception:
+                pass
+
+            finviz_data = None
+            try:
+                finviz_data = finviz.get_all_signals()
+            except Exception:
+                pass
+
+            for horizon_key, pick in top3:
+                symbol = pick['ticker']
+                try:
+                    ai_result = run_composite_analysis(
+                        symbol=symbol,
+                        db_manager=db,
+                        technical_analyzer=analyzer,
+                        news_scraper=news_scraper,
+                        reddit_scraper=reddit_scraper_instance,
+                        finviz_data=finviz_data,
+                    )
+                    if 'error' not in ai_result:
+                        pick['ai_analysis'] = {
+                            'composite_score': ai_result.get('composite_score', 0),
+                            'signal': ai_result.get('signal', 'HOLD'),
+                            'confidence': ai_result.get('confidence', 'LOW'),
+                            'reasoning': ai_result.get('reasoning', ''),
+                            'action': ai_result.get('action', {}),
+                            'sub_scores': {
+                                'technical': ai_result.get('sub_scores', {}).get('technical', {}).get('score', 0),
+                                'fundamental': ai_result.get('sub_scores', {}).get('fundamental', {}).get('score', 0),
+                                'sentiment': ai_result.get('sub_scores', {}).get('sentiment', {}).get('score', 0),
+                                'ai_insight': ai_result.get('sub_scores', {}).get('ai_insight', {}).get('score', 0),
+                            },
+                            'consensus': ai_result.get('sub_scores', {}).get('ai_insight', {}).get('consensus'),
+                            'consensus_confidence': ai_result.get('sub_scores', {}).get('ai_insight', {}).get('consensus_confidence'),
+                            'agreement_note': ai_result.get('sub_scores', {}).get('ai_insight', {}).get('agreement_note', ''),
+                            'risks': ai_result.get('sub_scores', {}).get('ai_insight', {}).get('risks', []),
+                        }
+                        pick['ai_enriched'] = True
+                        print(f"  ✅ AI analysis for {symbol}: {ai_result.get('signal')} ({ai_result.get('composite_score')}/100)")
+                except Exception as e:
+                    print(f"  ⚠️  AI analysis failed for {symbol}: {e}")
+                    pick['ai_enriched'] = False
+
+        _set_screener_cache(result)
+        return {**result, "cached": False}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ========== ANALYSIS HISTORY ENDPOINT ==========
+
+@app.get("/api/calibration/report")
+async def get_calibration_report(horizon: int = 10, lookback: int = 180, bins: int = 10):
+    """
+    Calibration metrics: Brier score, reliability table, ECE.
+    Tells you whether stated confidence matches realized hit rate.
+    """
+    try:
+        from analysis.calibration import calibration_report
+        if horizon not in (5, 10, 30):
+            raise HTTPException(status_code=400, detail="horizon must be 5, 10, or 30")
+        report = calibration_report(db, horizon=horizon, lookback_days=lookback, n_bins=bins)
+        return report
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/analysis/{ticker}/history")
 async def get_analysis_history(ticker: str):
@@ -994,6 +1253,13 @@ def _source_credibility(source: str, source_type: str) -> int:
         return 35
     if source_type == "finviz":
         return 55
+    if source_type == "stocktwits":
+        return 40
+    if source_type == "twitter":
+        # Trusted finance accounts get higher credibility
+        if "✓" in source:
+            return 75
+        return 45
     return 45
 
 def _compute_importance(article: dict) -> int:
@@ -1119,6 +1385,47 @@ def _collect_all_news() -> list:
     except Exception as e:
         print(f"⚠️  Finviz collection error: {e}")
 
+    # 4. StockTwits — trending tickers with sentiment
+    try:
+        from data_collection.stocktwits_scraper import StockTwitsScraper
+        st = StockTwitsScraper()
+        st_articles = st.get_trending_as_articles(limit=20)
+        for item in st_articles:
+            raw_articles.append({
+                "id": str(uuid.uuid4()),
+                "headline": item.get("headline", ""),
+                "source": item.get("source", "StockTwits"),
+                "source_type": "stocktwits",
+                "url": item.get("url", ""),
+                "published_at": item.get("published_at", ""),
+                "description": item.get("description", ""),
+                "source_tags": ["stocktwits"],
+            })
+        print(f"   StockTwits: {len(st_articles)} trending articles")
+    except Exception as e:
+        print(f"⚠️  StockTwits collection error: {e}")
+
+    # 5. Twitter/X — financial tweets (if bearer token configured)
+    try:
+        from data_collection.twitter_scraper import TwitterScraper
+        tw = TwitterScraper()
+        if tw.enabled:
+            tw_articles = tw.get_financial_tweets_as_articles(max_results=25)
+            for item in tw_articles:
+                raw_articles.append({
+                    "id": str(uuid.uuid4()),
+                    "headline": item.get("headline", ""),
+                    "source": item.get("source", "Twitter/X"),
+                    "source_type": "twitter",
+                    "url": item.get("url", ""),
+                    "published_at": item.get("published_at", ""),
+                    "description": item.get("description", ""),
+                    "source_tags": ["twitter"],
+                })
+            print(f"   Twitter/X: {len(tw_articles)} financial tweets")
+    except Exception as e:
+        print(f"⚠️  Twitter collection error: {e}")
+
     return raw_articles
 
 def _ai_analyze_batch(articles: list) -> list:
@@ -1130,32 +1437,44 @@ def _ai_analyze_batch(articles: list) -> list:
     # Build article summaries for the prompt
     article_texts = []
     for i, a in enumerate(articles):
-        article_texts.append(f"{i+1}. [{a.get('source', '')}] {a.get('headline', '')}\n   {a.get('description', '')[:200]}")
+        article_texts.append(f"{i+1}. [{a.get('source', '')}] {a.get('headline', '')}\n   {(a.get('description') or '')[:200]}")
 
     articles_block = "\n".join(article_texts)
 
-    prompt = f"""You are a financial news analyst. For each article below, determine:
+    prompt = f"""You are an elite buy-side trading analyst. Your job is to find BUYING OPPORTUNITIES.
 
-1. AFFECTED TICKER(S) — which specific stock(s) will be impacted. Be specific, not vague. If it's a macro story (Fed rates, tariffs), list the ETFs and sectors affected.
-2. DIRECTION — bullish or bearish for each ticker
-3. MAGNITUDE — low / medium / high impact
-4. SIGNAL — one of: STRONG_BUY, BUY, WATCH, IGNORE, SELL, SHORT
-5. TIME SENSITIVITY — is this actionable now, this week, or long-term?
-6. REASONING — 2-3 sentences max explaining the trade logic
+Your user is a retail trader who wants to know: "What should I buy right now, and why?"
+They do NOT care about sell signals for stocks they don't own. Sell/short signals are only useful for active hedging plays.
 
-Be decisive. "WATCH" is acceptable for genuinely unclear situations, but don't default to it. If a story clearly helps or hurts a stock, say so.
+For each article below, provide:
+
+1. WHY THIS MATTERS — one sentence on why this news is significant for traders
+2. AFFECTED TICKER(S) — specific stock(s) impacted. For macro stories (Fed, tariffs, geopolitical), name the ETFs and top 2-3 individual stocks affected.
+3. ACTION — one of: STRONG_BUY, BUY, SHORT (only if clear bearish catalyst with profit opportunity), SKIP (not actionable)
+4. MAGNITUDE — low / medium / high
+5. TIME SENSITIVITY — actionable_now, this_week, or long_term
+6. TRADE THESIS — 2-3 sentences: what the catalyst is, what price action to expect, and how to play it
+
+RULES:
+- Be decisive. Default to finding the opportunity, not hedging your language.
+- For bullish catalysts (FDA approvals, earnings beats, upgrades, breakthroughs): signal BUY or STRONG_BUY
+- For bearish catalysts that create SHORT opportunities with real profit potential: signal SHORT
+- If the news is noise, signal SKIP — don't waste time on it
+- STRONG_BUY = high conviction, act now. BUY = solid opportunity, worth a position.
+- Every non-SKIP article MUST have at least one specific ticker with a direction.
 
 Articles:
 {articles_block}
 
-Respond in JSON array format only. Each element should have:
-- "article_index": (1-based index matching the article number above)
-- "affected_tickers": [{{"ticker": "XXX", "direction": "bullish|bearish", "signal": "STRONG_BUY|BUY|WATCH|IGNORE|SELL|SHORT"}}]
+Respond in JSON array format only. Each element:
+- "article_index": (1-based index)
+- "why_it_matters": "string"
+- "affected_tickers": [{{"ticker": "XXX", "direction": "bullish|bearish", "signal": "STRONG_BUY|BUY|SHORT|SKIP"}}]
 - "magnitude": "low|medium|high"
 - "time_sensitivity": "actionable_now|this_week|long_term"
-- "reasoning": "string"
+- "trade_thesis": "string"
 
-No preamble. JSON array only."""
+JSON array only. No preamble."""
 
     try:
         response = client.messages.create(
@@ -1194,22 +1513,40 @@ def _build_intelligence_response(articles: list, ai_results: list) -> dict:
         ai = ai_map.get(i + 1, {})
         affected = ai.get("affected_tickers", [])
         magnitude = ai.get("magnitude", "low")
-        reasoning = ai.get("reasoning", "")
+        why_it_matters = ai.get("why_it_matters", "")
+        trade_thesis = ai.get("trade_thesis", ai.get("reasoning", ""))
         time_sensitivity = ai.get("time_sensitivity", "this_week")
 
-        # Compute final importance score
+        # Filter out SKIP tickers — keep only actionable ones
+        actionable_tickers = [t for t in affected if t.get("signal") != "SKIP"]
+
+        # Compute final importance score — buy-opportunity weighted
         base_score = _compute_importance(article)
-        # Boost based on AI analysis
-        mag_boost = {"high": 25, "medium": 10, "low": 0}.get(magnitude, 0)
-        ticker_boost = min(len(affected) * 3, 15)
+        mag_boost = {"high": 30, "medium": 12, "low": 0}.get(magnitude, 0)
+        ticker_boost = min(len(actionable_tickers) * 4, 20)
+
+        # Heavy boost for buy signals, modest for shorts
         signal_boost = 0
-        for t in affected:
-            sig = t.get("signal", "WATCH")
-            if sig in ("STRONG_BUY", "SHORT"):
+        has_buy = False
+        for t in actionable_tickers:
+            sig = t.get("signal", "SKIP")
+            if sig == "STRONG_BUY":
+                signal_boost = max(signal_boost, 25)
+                has_buy = True
+            elif sig == "BUY":
                 signal_boost = max(signal_boost, 15)
-            elif sig in ("BUY", "SELL"):
+                has_buy = True
+            elif sig == "SHORT":
                 signal_boost = max(signal_boost, 8)
-        importance = min(base_score + mag_boost + ticker_boost + signal_boost, 100)
+
+        # Time sensitivity boost — actionable_now gets priority
+        time_boost = {"actionable_now": 15, "this_week": 5, "long_term": 0}.get(time_sensitivity, 0)
+
+        importance = min(base_score + mag_boost + ticker_boost + signal_boost + time_boost, 100)
+
+        # If all tickers are SKIP and no actionable content, heavily penalize
+        if not actionable_tickers:
+            importance = min(importance, 20)
 
         for t in affected:
             all_tickers.add(t.get("ticker", ""))
@@ -1226,10 +1563,11 @@ def _build_intelligence_response(articles: list, ai_results: list) -> dict:
             "published_at": article.get("published_at", ""),
             "importance_score": importance,
             "ai_analysis": {
+                "why_it_matters": why_it_matters,
                 "affected_tickers": affected,
                 "magnitude": magnitude,
                 "time_sensitivity": time_sensitivity,
-                "reasoning": reasoning,
+                "trade_thesis": trade_thesis,
             },
             "source_tags": article.get("source_tags", []),
         }
@@ -1247,7 +1585,7 @@ def _build_intelligence_response(articles: list, ai_results: list) -> dict:
                 "affected_tickers": json.dumps(affected),
                 "signals": json.dumps([t.get("signal") for t in affected]),
                 "magnitude": magnitude,
-                "reasoning": reasoning,
+                "reasoning": f"{why_it_matters}\n\n{trade_thesis}".strip(),
             })
         except Exception:
             pass
@@ -1516,56 +1854,16 @@ async def get_paper_trading_history():
 
 @app.post("/api/paper-trading/run-algo")
 async def run_paper_trading_algo():
-    """Trigger the daily paper trading algorithm with SSE progress streaming."""
-    import asyncio
-    import queue
-    import threading
-    from fastapi.responses import StreamingResponse
-
-    progress_queue = queue.Queue()
-
-    def on_progress(step, detail=""):
-        progress_queue.put({"step": step, "detail": detail})
-
-    result_holder = [None]
-    error_holder = [None]
-
-    def run_algo():
-        try:
-            from trading.paper_trader import PaperTrader
-            trader = PaperTrader(db, analyzer, news_scraper, on_progress=on_progress)
-            result_holder[0] = trader.run_daily_algo()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            error_holder[0] = str(e)
-        finally:
-            progress_queue.put(None)  # sentinel
-
-    thread = threading.Thread(target=run_algo, daemon=True)
-    thread.start()
-
-    async def event_stream():
-        import json as _json
-        while True:
-            try:
-                msg = await asyncio.get_event_loop().run_in_executor(None, progress_queue.get, True, 0.5)
-            except queue.Empty:
-                # Send keepalive comment
-                yield ": keepalive\n\n"
-                continue
-
-            if msg is None:
-                # Algo finished — send final result
-                if error_holder[0]:
-                    yield f"data: {_json.dumps({'type': 'error', 'detail': error_holder[0]})}\n\n"
-                else:
-                    yield f"data: {_json.dumps({'type': 'result', **result_holder[0]})}\n\n"
-                break
-            else:
-                yield f"data: {_json.dumps({'type': 'progress', **msg})}\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    """Trigger the daily paper trading algorithm. Returns JSON with results + skip log."""
+    try:
+        from trading.paper_trader import PaperTrader
+        trader = PaperTrader(db, analyzer, news_scraper)
+        result = trader.run_daily_algo()
+        return result
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/paper-trading/reset")
@@ -1584,6 +1882,139 @@ async def reset_paper_trading():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========== PAPER TRADING SCHEDULER ==========
+
+import threading
+import time as _time
+from datetime import datetime as _dt, date as _date
+
+_paper_algo_scheduler = {
+    "enabled": True,
+    "run_time": "16:30",       # 4:30 PM ET — after market close
+    "last_run_date": None,
+    "last_run_result": None,
+    "running_now": False,
+    "thread_alive": False,
+}
+
+
+def _is_trading_day():
+    """Check if today is a weekday (Mon-Fri). Doesn't account for holidays."""
+    return _date.today().weekday() < 5
+
+
+def _run_scheduled_algo():
+    """Execute the paper trading algo and store the result."""
+    _paper_algo_scheduler["running_now"] = True
+    try:
+        from trading.paper_trader import PaperTrader
+        trader = PaperTrader(db, analyzer, news_scraper)
+        result = trader.run_daily_algo()
+        _paper_algo_scheduler["last_run_date"] = _date.today().isoformat()
+        _paper_algo_scheduler["last_run_result"] = {
+            "status": "success",
+            "actions_count": len(result.get("actions", [])),
+            "skipped_count": len(result.get("skipped_candidates", [])),
+            "elapsed_seconds": result.get("elapsed_seconds", 0),
+            "timestamp": _dt.now().isoformat(),
+        }
+        print(f"✅ Scheduled paper algo complete — {len(result.get('actions', []))} actions")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _paper_algo_scheduler["last_run_date"] = _date.today().isoformat()
+        _paper_algo_scheduler["last_run_result"] = {
+            "status": "error",
+            "error": str(e),
+            "timestamp": _dt.now().isoformat(),
+        }
+        print(f"❌ Scheduled paper algo failed: {e}")
+    finally:
+        _paper_algo_scheduler["running_now"] = False
+
+
+def _scheduler_loop():
+    """Background thread that checks the schedule every 30 seconds."""
+    import schedule
+
+    run_time = _paper_algo_scheduler["run_time"]
+    schedule.every().day.at(run_time).do(_check_and_run)
+    print(f"⏰ Paper trading scheduler started — daily at {run_time} ET on trading days")
+
+    _paper_algo_scheduler["thread_alive"] = True
+    while _paper_algo_scheduler["enabled"]:
+        schedule.run_pending()
+        _time.sleep(30)
+    _paper_algo_scheduler["thread_alive"] = False
+    print("⏰ Paper trading scheduler stopped")
+
+
+def _check_and_run():
+    """Only run if it's a trading day and hasn't already run today."""
+    today = _date.today().isoformat()
+    if not _is_trading_day():
+        print(f"⏰ Skipping paper algo — {today} is not a trading day")
+        return
+    if _paper_algo_scheduler["last_run_date"] == today:
+        print(f"⏰ Skipping paper algo — already ran today ({today})")
+        return
+    if _paper_algo_scheduler["running_now"]:
+        print(f"⏰ Skipping paper algo — already running")
+        return
+    print(f"⏰ Triggering scheduled paper trading algo for {today}")
+    _run_scheduled_algo()
+
+
+# Start the scheduler thread on server boot
+_scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True)
+_scheduler_thread.start()
+
+
+@app.get("/api/paper-trading/scheduler")
+async def get_paper_trading_scheduler():
+    """Get paper trading scheduler status."""
+    return {
+        "enabled": _paper_algo_scheduler["enabled"],
+        "run_time": _paper_algo_scheduler["run_time"],
+        "last_run_date": _paper_algo_scheduler["last_run_date"],
+        "last_run_result": _paper_algo_scheduler["last_run_result"],
+        "running_now": _paper_algo_scheduler["running_now"],
+        "thread_alive": _paper_algo_scheduler["thread_alive"],
+        "next_run": f"Today at {_paper_algo_scheduler['run_time']} ET" if _is_trading_day() and _paper_algo_scheduler["last_run_date"] != _date.today().isoformat() else "Next trading day",
+    }
+
+
+@app.post("/api/paper-trading/scheduler")
+async def update_paper_trading_scheduler(enabled: bool = None, run_time: str = None):
+    """Update paper trading scheduler settings."""
+    if enabled is not None:
+        _paper_algo_scheduler["enabled"] = enabled
+        if enabled and not _paper_algo_scheduler["thread_alive"]:
+            # Restart the thread
+            t = threading.Thread(target=_scheduler_loop, daemon=True)
+            t.start()
+    if run_time is not None:
+        # Validate HH:MM format
+        try:
+            _dt.strptime(run_time, "%H:%M")
+            _paper_algo_scheduler["run_time"] = run_time
+            # Reschedule — restart thread to pick up new time
+            if _paper_algo_scheduler["enabled"]:
+                _paper_algo_scheduler["enabled"] = False
+                _time.sleep(1)
+                _paper_algo_scheduler["enabled"] = True
+                t = threading.Thread(target=_scheduler_loop, daemon=True)
+                t.start()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="run_time must be HH:MM format (e.g. '16:30')")
+
+    return {
+        "enabled": _paper_algo_scheduler["enabled"],
+        "run_time": _paper_algo_scheduler["run_time"],
+        "message": "Scheduler updated",
+    }
 
 
 # ========== FIDELITY BROKERAGE SYNC ==========

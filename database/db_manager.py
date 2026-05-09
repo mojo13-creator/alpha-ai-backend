@@ -162,7 +162,11 @@ class DatabaseManager:
                     target_price REAL,
                     weight_profile TEXT,
                     market_cap_category TEXT,
-                    raw_response TEXT
+                    raw_response TEXT,
+                    realized_return_5d REAL,
+                    realized_return_10d REAL,
+                    realized_return_30d REAL,
+                    realized_filled_at TIMESTAMP
                 )
             """)
             cursor.execute("""
@@ -358,7 +362,11 @@ class DatabaseManager:
                     target_price REAL,
                     weight_profile TEXT,
                     market_cap_category TEXT,
-                    raw_response TEXT
+                    raw_response TEXT,
+                    realized_return_5d REAL,
+                    realized_return_10d REAL,
+                    realized_return_30d REAL,
+                    realized_filled_at DATETIME
                 )
             """)
             cursor.execute("""
@@ -443,6 +451,7 @@ class DatabaseManager:
 
         # Safe ALTER — add new portfolio columns if they don't exist
         self._migrate_portfolio_table()
+        self._migrate_analysis_history_table()
 
         print("✅ Database initialized successfully!")
 
@@ -472,6 +481,46 @@ class DatabaseManager:
                 pass  # Column already exists
         conn.commit()
         conn.close()
+
+    def _migrate_analysis_history_table(self):
+        """Add realized return columns if they don't exist (safe for re-runs)."""
+        ts_type = "TIMESTAMP" if DB_TYPE == "postgres" else "DATETIME"
+        new_columns = [
+            ("realized_return_5d", "REAL"),
+            ("realized_return_10d", "REAL"),
+            ("realized_return_30d", "REAL"),
+            ("realized_filled_at", ts_type),
+        ]
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        for col_name, col_type in new_columns:
+            try:
+                cursor.execute(f"ALTER TABLE analysis_history ADD COLUMN {col_name} {col_type}")
+                conn.commit()
+            except Exception:
+                conn.rollback()  # Postgres aborts the txn on duplicate-column error
+        conn.close()
+
+    def update_analysis_realized_returns(self, analysis_id, r5=None, r10=None, r30=None):
+        """Persist realized returns for a past analysis row."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"""
+                UPDATE analysis_history
+                SET realized_return_5d = {PH},
+                    realized_return_10d = {PH},
+                    realized_return_30d = {PH},
+                    realized_filled_at = CURRENT_TIMESTAMP
+                WHERE id = {PH}
+            """, (r5, r10, r30, analysis_id))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"⚠️  Error updating realized returns for id={analysis_id}: {e}")
+            return False
+        finally:
+            conn.close()
 
     # ========== STOCK PRICE OPERATIONS ==========
 

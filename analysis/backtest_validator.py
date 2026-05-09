@@ -127,10 +127,11 @@ def validate_signals(db_manager, horizons=(5, 10, 30), min_days_old=5,
     lookback_start = datetime.now() - timedelta(days=lookback_days)
 
     query = """
-        SELECT ticker, timestamp, composite_score, technical_score,
+        SELECT id, ticker, timestamp, composite_score, technical_score,
                fundamental_score, sentiment_score, ai_insight_score,
                signal, confidence, risk_level, entry_price,
-               market_cap_category
+               market_cap_category,
+               realized_return_5d, realized_return_10d, realized_return_30d
         FROM analysis_history
         WHERE timestamp <= %s AND timestamp >= %s
         ORDER BY timestamp ASC
@@ -171,20 +172,43 @@ def validate_signals(db_manager, horizons=(5, 10, 30), min_days_old=5,
             print(f"  {i}/{len(tickers)} fetched...")
         price_cache[t] = _fetch_price_window(t, fetch_start, fetch_end)
 
-    # Build outcome rows: one per (analysis, horizon)
+    # Build outcome rows: one per (analysis, horizon).
+    # Use cached realized returns when present; compute + persist when missing.
+    HORIZON_COL = {5: 'realized_return_5d', 10: 'realized_return_10d', 30: 'realized_return_30d'}
     outcomes = []
+    persisted = 0
     for _, row in history.iterrows():
         ticker = row['ticker']
         signal = row['signal']
         ts = row['timestamp']
+        analysis_id = row.get('id')
         price_df = price_cache.get(ticker)
-        if price_df is None or price_df.empty:
-            continue
 
+        # Compute (or reuse cached) returns at each horizon
+        per_horizon = {}
         for h in horizons:
-            ret = _realized_return(price_df, pd.Timestamp(ts).normalize(), h)
-            if ret is None:
-                continue
+            cached = row.get(HORIZON_COL.get(h)) if h in HORIZON_COL else None
+            if cached is not None and not (isinstance(cached, float) and math.isnan(cached)):
+                per_horizon[h] = float(cached)
+            elif price_df is not None and not price_df.empty:
+                ret = _realized_return(price_df, pd.Timestamp(ts).normalize(), h)
+                if ret is not None:
+                    per_horizon[h] = ret
+
+        # Persist any newly-computed returns (only for horizons in HORIZON_COL)
+        if analysis_id is not None:
+            new_5 = per_horizon.get(5) if pd.isna(row.get('realized_return_5d')) else None
+            new_10 = per_horizon.get(10) if pd.isna(row.get('realized_return_10d')) else None
+            new_30 = per_horizon.get(30) if pd.isna(row.get('realized_return_30d')) else None
+            if any(v is not None for v in (new_5, new_10, new_30)):
+                # Preserve existing values for horizons we didn't refresh
+                final_5 = new_5 if new_5 is not None else (None if pd.isna(row.get('realized_return_5d')) else float(row.get('realized_return_5d')))
+                final_10 = new_10 if new_10 is not None else (None if pd.isna(row.get('realized_return_10d')) else float(row.get('realized_return_10d')))
+                final_30 = new_30 if new_30 is not None else (None if pd.isna(row.get('realized_return_30d')) else float(row.get('realized_return_30d')))
+                if db_manager.update_analysis_realized_returns(int(analysis_id), final_5, final_10, final_30):
+                    persisted += 1
+
+        for h, ret in per_horizon.items():
             result = _score_prediction(signal, ret)
             outcomes.append({
                 'ticker': ticker,
@@ -201,6 +225,9 @@ def validate_signals(db_manager, horizons=(5, 10, 30), min_days_old=5,
                 'sentiment_score': row.get('sentiment_score'),
                 'ai_insight_score': row.get('ai_insight_score'),
             })
+
+    if verbose and persisted:
+        print(f"  Persisted realized returns for {persisted} rows")
 
     if not outcomes:
         return {'error': 'No outcomes could be computed (price data missing or insufficient horizon)'}
