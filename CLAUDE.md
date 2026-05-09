@@ -13,21 +13,24 @@
 
 | | URL / Path |
 |---|---|
-| Frontend | https://alpha-ai-app-pied.vercel.app |
-| Backend | https://web-production-27e7e9.up.railway.app |
+| Frontend (Vercel) | https://alpha-ai-app-pied.vercel.app |
+| Backend (live, via ngrok → local) | https://knapsack-mulch-eloquent.ngrok-free.dev |
+| Backend (cloud, Render free tier) | configured in `render.yaml` (replaces Railway) |
 | GitHub FE | github.com/mojo13-creator/alpha-ai-app |
 | GitHub BE | github.com/mojo13-creator/alpha-ai-backend |
 | Local BE | ~/Desktop/stock-analyzer |
 | Local FE | ~/Desktop/alpha-ai-app |
 | Venv | ~/Desktop/stock-analyzer/venv |
 
+**Architecture (current):** Vercel-hosted Next.js frontend calls FastAPI running locally on port 8000, exposed via the reserved ngrok domain above. Vercel's `NEXT_PUBLIC_API_URL` points at the ngrok URL. Boot the backend with `./start-local.sh`. Railway is deprecated; Render Blueprint (`render.yaml`) is the cloud fallback.
+
 ## Tech Stack
 
-**Backend:** Python 3.13 (Railway) / 3.14 (local), FastAPI, SQLite (local) / PostgreSQL (Railway), slowapi, anthropic SDK, yfinance, newsapi.ai (Event Registry, via requests), finvizfinance, praw
+**Backend:** Python 3.14 (local) / 3.13 (cloud), FastAPI, SQLite (local) / PostgreSQL (cloud via `DATABASE_URL`), slowapi, anthropic SDK, yfinance, newsapi.ai (Event Registry, via requests), finvizfinance, praw
 
-**Frontend:** Next.js 14 (App Router), TypeScript, Tailwind, Framer Motion, shadcn/ui, Recharts, Clerk auth (dev keys)
+**Frontend:** Next.js 14 (App Router), TypeScript, Tailwind, Framer Motion, shadcn/ui, Recharts, Clerk auth (dev keys). Mobile: Expo (single codebase).
 
-**AI Models:** Claude Sonnet (`claude-sonnet-4-20250514`), Gemini (`gemini-2.5-flash`), GPT-4o — 3-model consensus. Perplexity planned (no key yet).
+**AI Models:** Claude Sonnet (`claude-sonnet-4-20250514`) BULL, Gemini (`gemini-2.5-flash`) BEAR, GPT-4o SYNTHESIZER — 3-model consensus. Perplexity planned (no key yet).
 
 ---
 
@@ -104,6 +107,7 @@ from reports.report_generator import ReportGenerator
 | GET | /api/finviz/screener | Finviz signals |
 | GET | /api/news/feed | AI-analyzed news feed |
 | GET/POST | /api/portfolio/pending | Fidelity import queue |
+| GET | /api/calibration/report | Brier score, ECE, reliability bins (signal calibration health) |
 
 ---
 
@@ -129,7 +133,7 @@ from reports.report_generator import ReportGenerator
 | `OPENAI_API_KEY` | Yes |
 | `PERPLEXITY_API_KEY` | Future |
 
-Railway also has `DATABASE_URL` (auto-set by PostgreSQL plugin).
+Cloud (Render) sets `DATABASE_URL` for PostgreSQL automatically.
 
 ---
 
@@ -141,20 +145,35 @@ Railway also has `DATABASE_URL` (auto-set by PostgreSQL plugin).
 - **NEVER `git add -A` or `git add .`** — always add specific files
 - **pip outside venv:** `--break-system-packages`
 
-## Run Locally
+## Run Locally (production path — Vercel hits this via ngrok)
 
+**Auto-start at login:** `~/Desktop/Restart Alpha AI.command` is registered as a macOS Login Item. It runs at every login, kills anything on `:8000` and stray ngrok, then `nohup`-detaches `start-local.sh` so the backend survives Terminal closing.
+
+**Manual restart:** double-click `Restart Alpha AI.command` on the Desktop. Same script — safe to re-run anytime.
+
+**Watch logs:** `tail -f ~/Library/Logs/alpha-ai-backend.out.log` (and `.err.log`).
+
+**Stop manually:** `lsof -ti:8000 | xargs kill -9 ; pkill -f "ngrok http"`
+
+**Foreground dev (when iterating on code):**
 ```bash
 lsof -ti:8000 | xargs kill -9
 cd ~/Desktop/stock-analyzer && source venv/bin/activate
 uvicorn api:app --reload --port 8000
 ```
 
+Note: a `~/Library/LaunchAgents/com.alphaai.backend.plist` was attempted but removed — macOS TCC blocks launchd from reading `~/Desktop`. The Login Item runs in user session context and bypasses that restriction.
+
 ## Deploy
 
-Backend: `git push origin main` → Railway auto-deploys
-Frontend: `git push origin main` (from ~/Desktop/alpha-ai-app) → Vercel auto-deploys
+Frontend: `git push origin main` (from `~/Desktop/alpha-ai-app`) → Vercel auto-deploys.
+Backend: live serving is local + ngrok via `start-local.sh`. Cloud fallback is Render (Blueprint at `render.yaml`); `git push origin main` triggers a Render build when wired.
 
-Pre-push: check no `.env` staged, no hardcoded secrets, `python3 -c "import ast; ast.parse(open('api.py').read())"`.
+**Pre-push checklist (security-critical):**
+1. No `.env` or `.env.*` staged: `git diff --cached --name-only | grep -E '^\.env'` returns nothing.
+2. No hardcoded secrets: `grep -rn "sk-ant-\|sk_test_\|sk_live_\|pk_test_\|pk_live_\|AIza" --include="*.py" --include="*.ts" --include="*.tsx" --exclude-dir=venv --exclude-dir=node_modules .`
+3. Syntax valid: `python3 -c "import ast; ast.parse(open('api.py').read())"`
+4. Never `git add -A` / `git add .` — stage files explicitly.
 
 Git user: `mojo13-creator`
 
@@ -166,10 +185,16 @@ Git user: `mojo13-creator`
 |---|---|---|
 | 1 | News Intelligence (`/news`) | Done |
 | 2 | Unified Reports + Screener (`/reports`) | Done — 3-horizon + AI top 3 |
-| 3 | Portfolio Tiers + Daily Scoring | Next |
-| 4 | Paper Trading (`/paper-trading`) | Pending |
-| 5 | Gemini Integration | Done — 2nd AI model in composite scorer |
-| 6 | Perplexity Integration | Waiting on key |
+| 3 | Portfolio Tiers + Daily Scoring | Done |
+| 4 | Paper Trading (`/paper-trading`) | Done |
+| 5 | Gemini Integration (BEAR role) | Done |
+| 6 | ChatGPT Integration (SYNTHESIZER role) | Done |
+| 7 | Berkeley institutional data enrichment | Done |
+| 8 | Fidelity sync (2FA, cash/crypto filtering) | Done |
+| 9 | Mobile app (Expo) | In progress — polish phase (Prompt 11B) |
+| 10 | Local Fidelity sync 2FA test script | Open |
+| 11 | Public launch ($29 Pro / $79 Elite) | Pending |
+| 12 | Perplexity Integration | Waiting on key |
 
 ### Ask Connor before:
 - Database migrations
