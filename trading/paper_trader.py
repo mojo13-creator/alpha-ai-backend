@@ -37,18 +37,37 @@ def get_current_price(ticker):
 
 
 class PaperTrader:
-    MAX_POSITION_SIZE = 0.15   # Max 15% of portfolio per position
+    MAX_POSITION_SIZE = 0.15   # Hard cap: no position larger than 15% of portfolio
     MAX_POSITIONS = 8          # Max 8 simultaneous positions
-    MIN_SCORE_TO_BUY = 72      # Only buy composite score 72+
+    MIN_SCORE_TO_BUY = 65      # Only buy composite score 65+
     SELL_SCORE_THRESHOLD = 35  # Sell if score drops below 35
 
-    def __init__(self, db_manager, technical_analyzer, news_scraper):
+    # Volatility-targeted position sizing: each position risks at most this fraction
+    # of total portfolio value if the stop loss is hit. Replaces fixed 15% rule.
+    # 1% per trade = max ~8% portfolio drawdown if all 8 positions stop out
+    # simultaneously, which is a tail event but bounded.
+    RISK_PER_POSITION_PCT = 0.01
+
+    # Time stop: exit if a position has been open this long with no meaningful
+    # move (|pnl_pct| < 3%). Caps opportunity cost on trades that just sit.
+    MAX_DAYS_FLAT = 21
+    FLAT_PNL_THRESHOLD_PCT = 3.0
+
+    def __init__(self, db_manager, technical_analyzer, news_scraper, on_progress=None):
         self.db = db_manager
         self.analyzer = technical_analyzer
         self.news_scraper = news_scraper
-        self.screener = DailyScreener(db_manager, technical_analyzer, news_scraper)
+        self.screener = DailyScreener(db_manager, technical_analyzer, news_scraper, on_progress=on_progress)
         self.account = self.db.get_paper_account()
         self.actions_taken = []
+        self.skipped_candidates = []  # why each candidate was rejected
+        self.screener_stats = {}      # pipeline stats (candidates → filtered → picks)
+        self.on_progress = on_progress  # callback(step, detail)
+
+    def _emit(self, step, detail=""):
+        """Send progress update if callback is set."""
+        if self.on_progress:
+            self.on_progress(step, detail)
 
     def _refresh_account(self):
         self.account = self.db.get_paper_account()
@@ -141,6 +160,25 @@ class PaperTrader:
                     if current_price <= trailing_stop:
                         exit_reason = f"Trailing stop triggered at ${current_price:.2f} (was up {pnl_pct:.1f}%)"
 
+            # Time stop: dead money — opened > MAX_DAYS_FLAT ago and barely moved.
+            # Frees capital for higher-conviction setups instead of letting it sit.
+            if exit_reason is None and entry_price > 0:
+                opened_at = pos.get("opened_at")
+                days_held = None
+                if opened_at:
+                    try:
+                        if isinstance(opened_at, str):
+                            opened_dt = datetime.fromisoformat(opened_at.replace("Z", "+00:00").split(".")[0])
+                        else:
+                            opened_dt = opened_at
+                        days_held = (datetime.now() - opened_dt.replace(tzinfo=None)).days
+                    except Exception:
+                        days_held = None
+                if days_held is not None and days_held >= self.MAX_DAYS_FLAT:
+                    pnl_pct = self.unrealized_pnl_pct(pos, current_price)
+                    if abs(pnl_pct) < self.FLAT_PNL_THRESHOLD_PCT:
+                        exit_reason = f"Time stop: held {days_held}d with PnL {pnl_pct:+.1f}% (flat) — freeing capital"
+
             if exit_reason:
                 self.execute_sell(pos, current_price, exit_reason)
             else:
@@ -153,11 +191,24 @@ class PaperTrader:
         """Find new buy candidates from the daily screener."""
         if self.open_position_count() >= self.MAX_POSITIONS:
             print(f"\n  Max positions ({self.MAX_POSITIONS}) reached — skipping entries")
+            self.skipped_candidates.append({
+                "ticker": "N/A",
+                "reason": f"Max positions ({self.MAX_POSITIONS}) reached — entry scan skipped entirely",
+            })
             return
 
         print(f"\n  Running screener for entry candidates...")
-        picks, _watchlist, stats = self.screener.run_pipeline(max_picks=10)
+        picks, _watchlist, stats = self.screener.run_pipeline(
+            max_picks=10, skip_ai=False, use_berkeley=False,
+        )
+        self.screener_stats = stats
         print(f"  Screener returned {len(picks)} picks")
+
+        if not picks:
+            self.skipped_candidates.append({
+                "ticker": "N/A",
+                "reason": "Screener returned 0 picks — no candidates passed the 3-stage pipeline",
+            })
 
         self._refresh_account()
 
@@ -169,18 +220,25 @@ class PaperTrader:
             if not ticker:
                 continue
 
-            if self.has_position(ticker):
-                print(f"    {ticker}: already holding, skip")
-                continue
-
             composite_score = candidate.get("composite_score", 0)
-            if composite_score < self.MIN_SCORE_TO_BUY:
-                print(f"    {ticker}: score {composite_score} < {self.MIN_SCORE_TO_BUY}, skip")
+            signal = candidate.get("signal", "HOLD")
+
+            if self.has_position(ticker):
+                skip_reason = "Already holding position"
+                print(f"    {ticker}: {skip_reason}")
+                self.skipped_candidates.append({"ticker": ticker, "score": composite_score, "signal": signal, "reason": skip_reason})
                 continue
 
-            signal = candidate.get("signal", "HOLD")
+            if composite_score < self.MIN_SCORE_TO_BUY:
+                skip_reason = f"Score {composite_score} below minimum {self.MIN_SCORE_TO_BUY}"
+                print(f"    {ticker}: {skip_reason}")
+                self.skipped_candidates.append({"ticker": ticker, "score": composite_score, "signal": signal, "reason": skip_reason})
+                continue
+
             if signal not in ("BUY", "STRONG_BUY"):
-                print(f"    {ticker}: signal {signal} not BUY/STRONG_BUY, skip")
+                skip_reason = f"Signal is {signal}, need BUY or STRONG_BUY"
+                print(f"    {ticker}: {skip_reason}")
+                self.skipped_candidates.append({"ticker": ticker, "score": composite_score, "signal": signal, "reason": skip_reason})
                 continue
 
             action = candidate.get("action", {})
@@ -188,24 +246,41 @@ class PaperTrader:
             if price <= 0:
                 price = safe_float(candidate.get("price", 0))
             if price <= 0:
-                print(f"    {ticker}: no valid price, skip")
+                skip_reason = "No valid price available"
+                print(f"    {ticker}: {skip_reason}")
+                self.skipped_candidates.append({"ticker": ticker, "score": composite_score, "signal": signal, "reason": skip_reason})
                 continue
 
             stop_loss = safe_float(action.get("stop_loss", 0))
             target = safe_float(action.get("target_price", 0))
 
-            # Position sizing: max 15% of portfolio or remaining cash
+            # Volatility-targeted position sizing: risk a fixed % of portfolio
+            # per trade based on the stop-loss distance. Tight stops = larger
+            # position; wide stops = smaller position. Same dollar risk per trade.
+            # Falls back to the hard 15% cap if no valid stop is available.
             self._refresh_account()
             total_value = safe_float(self.account.get("total_value", 10000))
             cash = safe_float(self.account.get("cash_balance", 0))
-            position_value = min(total_value * self.MAX_POSITION_SIZE, cash)
+            hard_cap = total_value * self.MAX_POSITION_SIZE
+            sizing_method = "hard_cap"
+
+            if stop_loss > 0 and stop_loss < price:
+                risk_per_share = price - stop_loss
+                target_dollar_risk = total_value * self.RISK_PER_POSITION_PCT
+                vol_target_value = (target_dollar_risk / risk_per_share) * price
+                position_value = min(vol_target_value, hard_cap, cash)
+                sizing_method = f"vol-targeted (risk ${target_dollar_risk:.0f}, stop {((price-stop_loss)/price)*100:.1f}% away)"
+            else:
+                position_value = min(hard_cap, cash)
 
             if position_value < 100:
-                print(f"    Insufficient cash (${cash:.2f}) — stopping entries")
+                skip_reason = f"Insufficient cash (${cash:.2f})"
+                print(f"    {skip_reason} — stopping entries")
+                self.skipped_candidates.append({"ticker": ticker, "score": composite_score, "signal": signal, "reason": skip_reason})
                 break
 
             shares = position_value / price
-            reason = f"Score {composite_score}, signal {signal}"
+            reason = f"Score {composite_score}, signal {signal} | sizing: {sizing_method}"
 
             self.execute_buy(
                 ticker=ticker,
@@ -321,20 +396,25 @@ class PaperTrader:
 
         # Step 1: Check exits
         print(f"\n--- STEP 1: EXIT CHECK ---")
+        self._emit("checking_exits", f"Reviewing {self.open_position_count()} open positions")
         self.check_exits()
 
         # Step 2: Find entries
         print(f"\n--- STEP 2: ENTRY SCAN ---")
+        self._emit("scanning_entries", "Gathering candidates from Finviz, news, Reddit")
         self.find_entries()
 
         # Step 3: Update account
         print(f"\n--- STEP 3: ACCOUNT UPDATE ---")
+        self._emit("updating_account", "Calculating portfolio value")
         self.update_account()
 
         elapsed = (datetime.now() - start).total_seconds()
         summary = self.get_summary()
         summary["elapsed_seconds"] = round(elapsed, 1)
         summary["actions"] = self.actions_taken
+        summary["skipped_candidates"] = self.skipped_candidates
+        summary["screener_stats"] = self.screener_stats
 
         print(f"\n{'='*60}")
         print(f"  ALGO COMPLETE — {len(self.actions_taken)} actions taken in {elapsed:.1f}s")
