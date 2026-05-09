@@ -151,15 +151,38 @@ def calculate_sec_edgar_adjustment(sec_data):
     if not sec_data:
         return 0, []
 
-    # --- Insider trading activity (Form 4 filings) ---
-    insider = sec_data.get("insider_summary", {})
-    if insider:
-        form4_count = insider.get("total_form4_filings", 0)
-        if form4_count > 10:
-            # Heavy insider activity — could be buying or selling
-            signals.append(f"SEC: {form4_count} insider transactions (90d)")
-        elif form4_count > 0:
-            signals.append(f"SEC: {form4_count} insider transactions (90d)")
+    # --- Insider trading activity ---
+    # Directional cluster signal from Form 4 XMLs: open-market buying by multiple
+    # insiders is one of the strongest free signals; lone purchases under $50K
+    # and 10b5-1 plan sales are noise. Count alone (old logic) had no direction.
+    insider_sig = sec_data.get("insider_signal")
+    if insider_sig:
+        cs = insider_sig.get("cluster_score", 0)
+        n_buy = insider_sig.get("distinct_buyers", 0)
+        n_sell = insider_sig.get("distinct_sellers", 0)
+        buy_val = insider_sig.get("total_buy_value", 0)
+        sell_val_open = insider_sig.get("sell_value_open_market", 0)
+        if cs >= 3:
+            adj += 6
+            signals.append(f"SEC insider CLUSTER BUY: {n_buy} insiders, ${buy_val/1e6:.1f}M (90d)")
+        elif cs == 2:
+            adj += 4
+            signals.append(f"SEC insider buying: {n_buy} insiders, ${buy_val/1e3:.0f}K (90d)")
+        elif cs == 1:
+            adj += 2
+            signals.append(f"SEC insider buy: ${buy_val/1e3:.0f}K (90d)")
+        elif cs == -1:
+            adj -= 3
+            signals.append(f"SEC insider selling: {n_sell} insiders, ${sell_val_open/1e6:.1f}M open-market (90d)")
+        elif cs == -2:
+            adj -= 5
+            signals.append(f"SEC heavy insider selling: {n_sell} insiders, ${sell_val_open/1e6:.1f}M (90d)")
+    else:
+        # Fall back to count if XML parse failed (e.g. very old form layouts)
+        insider = sec_data.get("insider_summary", {})
+        form4_count = insider.get("total_form4_filings", 0) if insider else 0
+        if form4_count > 0:
+            signals.append(f"SEC: {form4_count} insider filings (90d, direction unknown)")
 
     # --- Material events (8-K filings) ---
     material_events = sec_data.get("material_events", 0)

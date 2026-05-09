@@ -349,7 +349,8 @@ def _berkeley_sentiment_adjustment(berkeley_data):
 
 def calculate_sentiment_score(news_articles, reddit_scraper=None, symbol='',
                                finviz_data=None, berkeley_data=None,
-                               current_price=None, price_df=None, ticker_obj=None):
+                               current_price=None, price_df=None, ticker_obj=None,
+                               sec_data=None):
     """
     Master function: calculates composite sentiment score (0-100).
     Returns dict with score, sub-components, and key_signals.
@@ -385,12 +386,24 @@ def calculate_sentiment_score(news_articles, reddit_scraper=None, symbol='',
         except Exception as e:
             options_signals = [f'Options signals unavailable: {e}']
 
-    # Composite: news 50%, reddit 25%, finviz + berkeley + options adjust the base
+    # Earnings press release tone (8-K Item 2.02 via Haiku, [-12, +12])
+    earnings_adj = 0
+    earnings_signals = []
+    earnings_info = None
+    if sec_data and sec_data.get('earnings_release') and symbol:
+        try:
+            from analysis.earnings_sentiment import score_earnings_release, earnings_signal_to_adjustment
+            earnings_info = score_earnings_release(sec_data['earnings_release'], symbol)
+            earnings_adj, earnings_signals = earnings_signal_to_adjustment(earnings_info)
+        except Exception as e:
+            earnings_signals = [f'Earnings release scoring unavailable: {e}']
+
+    # Composite: news 50%, reddit 25%, finviz + berkeley + options + earnings adjust the base
     base_score = news_score * 0.50 + reddit_score * 0.25 + 50 * 0.25
-    composite = base_score + finviz_adj + berkeley_adj + options_adj
+    composite = base_score + finviz_adj + berkeley_adj + options_adj + earnings_adj
     composite = max(0, min(100, round(composite)))
 
-    all_signals = news_signals + reddit_signals + finviz_signals + berkeley_signals + options_signals
+    all_signals = news_signals + reddit_signals + finviz_signals + berkeley_signals + options_signals + earnings_signals
     analyst_label = 'N/A'
     for sig in finviz_signals:
         if 'upgrade' in sig.lower():
